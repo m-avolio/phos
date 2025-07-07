@@ -3,6 +3,9 @@
 #include <math.h>
 #include <limits>
 #include <random>
+#include <filesystem>
+#include <chrono>
+#include <complex>
 
 #include "rkcommon/math/vec.h"
 #include "rkcommon/memory/malloc.h"
@@ -13,59 +16,16 @@
 #include "camera.h"
 #include "sensor.h"
 
-/*
- * A minimal tutorial. 
- *
- * It demonstrates how to intersect a ray with a single triangle. It is
- * meant to get you started as quickly as possible, and does not output
- * an image. 
- *
- * For more complex examples, see the other tutorials.
- *
- * Compile this file using
- *   
- *   gcc -std=c99 \
- *       -I<PATH>/<TO>/<EMBREE>/include \
- *       -o minimal \
- *       minimal.c \
- *       -L<PATH>/<TO>/<EMBREE>/lib \
- *       -lembree4 
- *
- * You should be able to compile this using a C or C++ compiler.
- */
+static constexpr float EPSILON = 1e-5;
+static constexpr int MAX_DEPTH = 5;
 
-/* 
- * This is only required to make the tutorial compile even when
- * a custom namespace is set.
- */
-#if defined(RTC_NAMESPACE_USE)
-RTC_NAMESPACE_USE
-#endif
+using namespace rkcommon::math;
 
-/*
- * We will register this error handler with the device in initializeDevice(),
- * so that we are automatically informed on errors.
- * This is extremely helpful for finding bugs in your code, prevents you
- * from having to add explicit error checking to each Embree API call.
- */
-void errorFunction(void* userPtr, enum RTCError error, const char* str)
-{
+void errorFunction(void* userPtr, enum RTCError error, const char* str) {
   printf("error %d: %s\n", error, str);
 }
 
-/*
- * Embree has a notion of devices, which are entities that can run 
- * raytracing kernels.
- * We initialize our device here, and then register the error handler so that 
- * we don't miss any errors.
- *
- * rtcNewDevice() takes a configuration string as an argument. See the API docs
- * for more information.
- *
- * Note that RTCDevice is reference-counted.
- */
-RTCDevice initializeDevice()
-{
+RTCDevice initializeDevice() {
   RTCDevice device = rtcNewDevice(NULL);
 
   if (!device)
@@ -75,13 +35,29 @@ RTCDevice initializeDevice()
   return device;
 }
 
-// Needs a redo
+struct Material {
+    std::vector<vec3f> albedo;
+    std::vector<std::complex<float>> ior;
+    std::vector<bool> specular;
+    std::vector<bool> emissive;
+};
+
+struct EmissiveTri {
+    uint32_t geomID;
+    uint32_t primID;
+    float area;
+    float power;
+    vec3f Le;
+};
+
 static RTCScene buildSceneFromOBJ(RTCDevice device,
                                   const std::string& objPath,
-                                  std::vector<uint32_t>& matID,
-                                  const std::vector<std::string>& mtlSearchPaths = {})
-{
-    // 1. Load the OBJ file (vertices, shapes and materials)
+                                  Material& mats,
+                                  std::vector<EmissiveTri>& emissives) {
+    // Get base dir path
+    std::filesystem::path baseDir = std::filesystem::path{objPath}.parent_path();
+
+    // Load obj
     tinyobj::attrib_t                attrib;
     std::vector<tinyobj::shape_t>    shapes;
     std::vector<tinyobj::material_t> materials;
@@ -92,75 +68,171 @@ static RTCScene buildSceneFromOBJ(RTCDevice device,
                                 &warn,
                                 &err,
                                 objPath.c_str(),
-                                /*mtl_basepath=*/mtlSearchPaths.empty() ? nullptr : mtlSearchPaths[0].c_str(),
-                                /*triangulate=*/true);
+                                baseDir.c_str(), 
+                                true);
+                               
 
+    // Warnings & Errors
     if (!warn.empty())  std::cerr << "OBJ warning: " << warn << "\n";
     if (!err.empty())   throw std::runtime_error("OBJ error: " + err);
     if (!ret)           throw std::runtime_error("Failed to load/parse OBJ");
 
-    // 2. Create a new Embree scene
+    // for (auto m: materials) {
+    //     std::cout << m.name << std::endl;
+    // }
+
+    // Load Materials
+    size_t N = materials.size();
+    mats.albedo.resize(N);
+    mats.ior.resize(N);
+    mats.emissive.resize(N);
+    mats.specular.resize(N);
     RTCScene scene = rtcNewScene(device);
 
-    // 3. For each shape in the OBJ, push its triangles into Embree
     for (size_t s = 0; s < shapes.size(); ++s) {
         const auto& mesh = shapes[s].mesh;
-        if (mesh.indices.empty()) continue;  // skip empty shapes
-
-        // Allocate a new triangle geometry
+        if (mesh.indices.empty()) continue;
         RTCGeometry geom = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
 
-        // -- Vertex buffer: use the global attrib.vertices (flat float list [x,y,z,x,y,z,...])
-        size_t    numVerts = attrib.vertices.size() / 3;
-        float*    vBuf     = static_cast<float*>(
-            rtcSetNewGeometryBuffer(geom,
+        // Vertices
+        size_t numVerts = attrib.vertices.size() / 3;
+        float* vBuf = static_cast<float*>(rtcSetNewGeometryBuffer(
+                                    geom,
                                     RTC_BUFFER_TYPE_VERTEX,
-                                    /*slot=*/0,
+                                    0,
                                     RTC_FORMAT_FLOAT3,
-                                    /*byteStride=*/3 * sizeof(float),
-                                    /*numVertices=*/numVerts));
+                                    3 * sizeof(float),
+                                    numVerts));
         std::memcpy(vBuf,
                     attrib.vertices.data(),
                     attrib.vertices.size() * sizeof(float));
 
-        // -- Index buffer: every 3 indices (must be triangles)
+        rtcSetGeometryVertexAttributeCount(geom, 1);
+        // Normals
+        float* nBuf = static_cast<float*>(rtcSetNewGeometryBuffer(geom,
+            RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE,
+            0, 
+            RTC_FORMAT_FLOAT3,
+            3*sizeof(float),
+            numVerts));
+
+        std::memcpy(nBuf,
+                    attrib.normals.data(),
+                    attrib.normals.size()*sizeof(float));
+
+        // Indices
         size_t numIndices = mesh.indices.size();
         if (numIndices % 3 != 0) {
             std::cerr << "Warning: non-triangle faces found, skipping remainder.\n";
         }
-        uint32_t* iBuf = static_cast<uint32_t*>(
-            rtcSetNewGeometryBuffer(geom,
+        uint32_t* iBuf = static_cast<uint32_t*>(rtcSetNewGeometryBuffer(
+                                    geom,
                                     RTC_BUFFER_TYPE_INDEX,
-                                    /*slot=*/0,
+                                    0,
                                     RTC_FORMAT_UINT3,
-                                    /*byteStride=*/3 * sizeof(uint32_t),
-                                    /*numTriangles=*/numIndices / 3));
+                                    3 * sizeof(uint32_t),
+                                    numIndices / 3));
+        // This seems weird, should just be some kind of memcpy?
         for (size_t f = 0; f + 2 < numIndices; f += 3) {
             iBuf[f + 0] = mesh.indices[f + 0].vertex_index;
             iBuf[f + 1] = mesh.indices[f + 1].vertex_index;
             iBuf[f + 2] = mesh.indices[f + 2].vertex_index;
         }
 
+
         rtcCommitGeometry(geom);
         uint32_t geomID = rtcAttachGeometry(scene, geom);
-        std::cout << geomID << std::endl;
 
-        // 4. Record material ID for this geometry
-        //    (we just take the first face's material, you could split by material if needed)
-        if (geomID >= matID.size()) matID.resize(geomID + 1);
-        matID[geomID] = mesh.material_ids.empty()
-                        ? 0u
-                        : static_cast<uint32_t>(mesh.material_ids[0]);
+        // Assuming one material ID per geom
+        auto material = materials[mesh.material_ids[0]];
+        mats.albedo[geomID] = vec3f(material.diffuse);
+        mats.ior[geomID]    = std::complex(material.ior, 0.0f);  // All dielectric for now
+        mats.emissive[geomID] = (material.name == "light") ? true : false;
+        mats.specular[geomID] = (material.name == "metal") ? true : false;
 
         rtcReleaseGeometry(geom);
     }
 
-    // 5. Commit and return
     rtcCommitScene(scene);
     return scene;
 }
+vec3f reflect(vec3f wi, vec3f n) {
+    return -2 * (dot(wi, n)) * n + wi;
+}
 
-void traceAndShade(RTCScene scene, const std::vector<uint32_t>& matID, RayBuffer& rb, Framebuffer& fb) {
+// Recursively trace one ray and return its color.
+vec3f traceRay(RTCScene scene,
+               const Material &mats,
+               RTCRayQueryContext &qctx,
+               RTCIntersectArguments &iargs,
+               RTCRayHit rayhit,
+               int depth)
+{
+    if (depth >= MAX_DEPTH)  
+        return vec3f{0.0f,0.0f,0.0f};
+
+    // reset hit and tfar
+    rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+    rayhit.ray.tfar   = std::numeric_limits<float>::infinity();
+
+    // intersect
+    rtcIntersect1(scene, &rayhit, &iargs);
+
+    if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
+        // missed—return black or environment lookup
+        return vec3f{0.0f,0.0f,0.0f};
+    }
+
+    uint32_t geomID = rayhit.hit.geomID;
+
+    // Compute shading normal (normalized)
+    vec3f Ng = normalize(
+      vec3f{ rayhit.hit.Ng_x,
+             rayhit.hit.Ng_y,
+             rayhit.hit.Ng_z }
+    );
+
+    if (mats.specular[geomID]) {
+        // build incident & reflection
+        vec3f I = normalize(vec3f{
+            rayhit.ray.dir_x,
+            rayhit.ray.dir_y,
+            rayhit.ray.dir_z
+        });
+        vec3f R = reflect(I, Ng);
+
+        // spawn origin just off the surface
+        vec3f org = vec3f{
+            rayhit.ray.org_x + I.x * rayhit.ray.tfar + Ng.x * EPSILON,
+            rayhit.ray.org_y + I.y * rayhit.ray.tfar + Ng.y * EPSILON,
+            rayhit.ray.org_z + I.z * rayhit.ray.tfar + Ng.z * EPSILON
+        };
+
+        // build new RTCRayHit
+        RTCRayHit newRH = {};
+        newRH.ray.org_x = org.x;
+        newRH.ray.org_y = org.y;
+        newRH.ray.org_z = org.z;
+        newRH.ray.dir_x = R.x;
+        newRH.ray.dir_y = R.y;
+        newRH.ray.dir_z = R.z;
+        newRH.ray.tnear = 0.0f;
+        newRH.ray.tfar  = std::numeric_limits<float>::infinity();
+        newRH.ray.time  = rayhit.ray.time;
+        newRH.ray.mask  = rayhit.ray.mask;
+        // recurse one level deeper
+        return mats.albedo[geomID] * traceRay(scene, mats, qctx, iargs, newRH, depth + 1);
+
+    } else {
+        // diffuse: just return albedo
+        return mats.albedo[geomID];
+    }
+}
+void traceAndShade(RTCScene scene,
+                   const Material& mats,
+                   RayBuffer& rb,
+                   Framebuffer& fb)
+{
     RTCRayQueryContext qctx;
     rtcInitRayQueryContext(&qctx);
 
@@ -170,29 +242,17 @@ void traceAndShade(RTCScene scene, const std::vector<uint32_t>& matID, RayBuffer
     iargs.flags   = RTC_RAY_QUERY_FLAG_COHERENT;
 
     for (size_t i = 0; i < rb.count; ++i) {
-        rtcIntersect1(scene, &rb.rh[i], &iargs);
+        // call our recursive helper with depth=0
+        vec3f col = traceRay(scene, mats, qctx, iargs, rb.rh[i], 0);
 
-        const RTCRayHit& rh = rb.rh[i];
         float* px = &fb.pixels[rb.pixel[i] * 3];
-
-        if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
-            // retrieve the hit distance
-            float dist = rh.ray.tfar;  
-
-            // map [0 .. maxT] → [1 .. 0], clamped, so near = white, far = black
-            float shade = 1.0f - std::min(dist / 8.0f, 1.0f);
-
-            // write a grayscale
-            px[0] = shade;
-            px[1] = shade;
-            px[2] = shade;
-        } else {
-            px[0] = px[1] = px[2] = 0.f;
-        }
+        px[0] = col.x;
+        px[1] = col.y;
+        px[2] = col.z;
     }
 }
+
 /* -------------------------------------------------------------------------- */
-using namespace rkcommon::math;
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -201,18 +261,18 @@ int main(int argc, char** argv) {
     }
     const std::string objPath = argv[1];
 
-    std::vector<uint32_t> matID;
+    Material mats; 
+    std::vector<EmissiveTri> emissives;
     /* Setup device + scene */
     RTCDevice device = initializeDevice();
-    // RTCScene  scene  = buildSceneFromUSD(device, usdPath, matID);
-    RTCScene  scene  = buildSceneFromOBJ(device, objPath, matID);
+    RTCScene  scene  = buildSceneFromOBJ(device, objPath, mats, emissives);
 
     // Camera
     Camera cam;
     cam.focal_length     = 0.050f;
     cam.width            = 0.036f;
     cam.height           = 0.024;
-    cam.position         = vec3f(0.f, 0.0f,  4.5f);
+    cam.position         = vec3f(0.f, 0.0f,  2.5f);
     cam.width_px  = 600;
     cam.height_px = 400;
 
@@ -239,8 +299,18 @@ int main(int argc, char** argv) {
     Framebuffer fb;
     fb.pixels.resize(N * 3);
 
-    // Trace
-    traceAndShade(scene, matID, rb, fb);
+    // --- TIMING START ---
+    auto t0 = std::chrono::high_resolution_clock::now();
+    traceAndShade(scene, mats, rb, fb);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    // --- TIMING END ---
+
+    std::chrono::duration<double> dt = t1 - t0;
+    double seconds = dt.count();
+    double mrays_per_s = (double)N / seconds / 1e6;
+
+    std::printf("Rendered %zu rays in %.3f s → %.2f Mrays/s\n",
+                N, seconds, mrays_per_s);
 
     // write PNG
     writePNG(fb, W, H, "render.png");
