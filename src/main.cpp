@@ -2,9 +2,13 @@
 #include <stdio.h>
 #include <math.h>
 #include <limits>
+#include <random>
 
 #include "rkcommon/math/vec.h"
 #include "rkcommon/memory/malloc.h"
+
+#define TINYOBJLOADER_IMPLEMENTATION 
+#include "tiny_obj_loader.h"
 
 #include "camera.h"
 #include "sensor.h"
@@ -71,79 +75,92 @@ RTCDevice initializeDevice()
   return device;
 }
 
-/*
- * Create a scene, which is a collection of geometry objects. Scenes are 
- * what the intersect / occluded functions work on. You can think of a 
- * scene as an acceleration structure, e.g. a bounding-volume hierarchy.
- *
- * Scenes, like devices, are reference-counted.
- */
-RTCScene initializeScene(RTCDevice device) {
-  RTCScene scene = rtcNewScene(device);
+// Needs a redo
+static RTCScene buildSceneFromOBJ(RTCDevice device,
+                                  const std::string& objPath,
+                                  std::vector<uint32_t>& matID,
+                                  const std::vector<std::string>& mtlSearchPaths = {})
+{
+    // 1. Load the OBJ file (vertices, shapes and materials)
+    tinyobj::attrib_t                attrib;
+    std::vector<tinyobj::shape_t>    shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string                      warn, err;
+    bool ret = tinyobj::LoadObj(&attrib,
+                                &shapes,
+                                &materials,
+                                &warn,
+                                &err,
+                                objPath.c_str(),
+                                /*mtl_basepath=*/mtlSearchPaths.empty() ? nullptr : mtlSearchPaths[0].c_str(),
+                                /*triangulate=*/true);
 
-  /* 
-   * Create a triangle mesh geometry, and initialize a single triangle.
-   * You can look up geometry types in the API documentation to
-   * find out which type expects which buffers.
-   *
-   * We create buffers directly on the device, but you can also use
-   * shared buffers. For shared buffers, special care must be taken
-   * to ensure proper alignment and padding. This is described in
-   * more detail in the API documentation.
-   */
-  RTCGeometry geom = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
-  float* vertices = (float*) rtcSetNewGeometryBuffer(geom,
-                                                     RTC_BUFFER_TYPE_VERTEX,
-                                                     0,
-                                                     RTC_FORMAT_FLOAT3,
-                                                     3*sizeof(float),
-                                                     3);
+    if (!warn.empty())  std::cerr << "OBJ warning: " << warn << "\n";
+    if (!err.empty())   throw std::runtime_error("OBJ error: " + err);
+    if (!ret)           throw std::runtime_error("Failed to load/parse OBJ");
 
-  unsigned* indices = (unsigned*) rtcSetNewGeometryBuffer(geom,
-                                                          RTC_BUFFER_TYPE_INDEX,
-                                                          0,
-                                                          RTC_FORMAT_UINT3,
-                                                          3*sizeof(unsigned),
-                                                          1);
+    // 2. Create a new Embree scene
+    RTCScene scene = rtcNewScene(device);
 
-  if (vertices && indices)
-  {
-    vertices[0] = -1.f; vertices[1] = 0.f; vertices[2] = 0.f;
-    vertices[3] = 1.f; vertices[4] = 0.f; vertices[5] = 0.f;
-    vertices[6] = 0.f; vertices[7] = 1.f; vertices[8] = 0.f;
+    // 3. For each shape in the OBJ, push its triangles into Embree
+    for (size_t s = 0; s < shapes.size(); ++s) {
+        const auto& mesh = shapes[s].mesh;
+        if (mesh.indices.empty()) continue;  // skip empty shapes
 
-    indices[0] = 0; indices[1] = 1; indices[2] = 2;
-  }
+        // Allocate a new triangle geometry
+        RTCGeometry geom = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
 
-  /*
-   * You must commit geometry objects when you are done setting them up,
-   * or you will not get any intersections.
-   */
-  rtcCommitGeometry(geom);
+        // -- Vertex buffer: use the global attrib.vertices (flat float list [x,y,z,x,y,z,...])
+        size_t    numVerts = attrib.vertices.size() / 3;
+        float*    vBuf     = static_cast<float*>(
+            rtcSetNewGeometryBuffer(geom,
+                                    RTC_BUFFER_TYPE_VERTEX,
+                                    /*slot=*/0,
+                                    RTC_FORMAT_FLOAT3,
+                                    /*byteStride=*/3 * sizeof(float),
+                                    /*numVertices=*/numVerts));
+        std::memcpy(vBuf,
+                    attrib.vertices.data(),
+                    attrib.vertices.size() * sizeof(float));
 
-  /*
-   * In rtcAttachGeometry(...), the scene takes ownership of the geom
-   * by increasing its reference count. This means that we don't have
-   * to hold on to the geom handle, and may release it. The geom object
-   * will be released automatically when the scene is destroyed.
-   *
-   * rtcAttachGeometry() returns a geometry ID. We could use this to
-   * identify intersected objects later on.
-   */
-  rtcAttachGeometry(scene, geom);
-  rtcReleaseGeometry(geom);
+        // -- Index buffer: every 3 indices (must be triangles)
+        size_t numIndices = mesh.indices.size();
+        if (numIndices % 3 != 0) {
+            std::cerr << "Warning: non-triangle faces found, skipping remainder.\n";
+        }
+        uint32_t* iBuf = static_cast<uint32_t*>(
+            rtcSetNewGeometryBuffer(geom,
+                                    RTC_BUFFER_TYPE_INDEX,
+                                    /*slot=*/0,
+                                    RTC_FORMAT_UINT3,
+                                    /*byteStride=*/3 * sizeof(uint32_t),
+                                    /*numTriangles=*/numIndices / 3));
+        for (size_t f = 0; f + 2 < numIndices; f += 3) {
+            iBuf[f + 0] = mesh.indices[f + 0].vertex_index;
+            iBuf[f + 1] = mesh.indices[f + 1].vertex_index;
+            iBuf[f + 2] = mesh.indices[f + 2].vertex_index;
+        }
 
-  /*
-   * Like geometry objects, scenes must be committed. This lets
-   * Embree know that it may start building an acceleration structure.
-   */
-  rtcCommitScene(scene);
+        rtcCommitGeometry(geom);
+        uint32_t geomID = rtcAttachGeometry(scene, geom);
+        std::cout << geomID << std::endl;
 
-  return scene;
+        // 4. Record material ID for this geometry
+        //    (we just take the first face's material, you could split by material if needed)
+        if (geomID >= matID.size()) matID.resize(geomID + 1);
+        matID[geomID] = mesh.material_ids.empty()
+                        ? 0u
+                        : static_cast<uint32_t>(mesh.material_ids[0]);
+
+        rtcReleaseGeometry(geom);
+    }
+
+    // 5. Commit and return
+    rtcCommitScene(scene);
+    return scene;
 }
 
-void traceAndShade(RTCScene scene, RayBuffer& rb, Framebuffer& fb)
-{
+void traceAndShade(RTCScene scene, const std::vector<uint32_t>& matID, RayBuffer& rb, Framebuffer& fb) {
     RTCRayQueryContext qctx;
     rtcInitRayQueryContext(&qctx);
 
@@ -159,7 +176,16 @@ void traceAndShade(RTCScene scene, RayBuffer& rb, Framebuffer& fb)
         float* px = &fb.pixels[rb.pixel[i] * 3];
 
         if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
-            px[0] = 1;  px[1] = 0;  px[2] = 0;
+            // retrieve the hit distance
+            float dist = rh.ray.tfar;  
+
+            // map [0 .. maxT] → [1 .. 0], clamped, so near = white, far = black
+            float shade = 1.0f - std::min(dist / 8.0f, 1.0f);
+
+            // write a grayscale
+            px[0] = shade;
+            px[1] = shade;
+            px[2] = shade;
         } else {
             px[0] = px[1] = px[2] = 0.f;
         }
@@ -168,18 +194,25 @@ void traceAndShade(RTCScene scene, RayBuffer& rb, Framebuffer& fb)
 /* -------------------------------------------------------------------------- */
 using namespace rkcommon::math;
 
-int main() {
-    /* Initialization. All of this may fail, but we will be notified by
-    * our errorFunction. */
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        printf("Usage: %s scene.usd\n", argv[0]);
+        return 0;
+    }
+    const std::string objPath = argv[1];
+
+    std::vector<uint32_t> matID;
+    /* Setup device + scene */
     RTCDevice device = initializeDevice();
-    RTCScene scene = initializeScene(device);
+    // RTCScene  scene  = buildSceneFromUSD(device, usdPath, matID);
+    RTCScene  scene  = buildSceneFromOBJ(device, objPath, matID);
 
     // Camera
     Camera cam;
-    cam.focal_length     = 0.010f;
+    cam.focal_length     = 0.050f;
     cam.width            = 0.036f;
     cam.height           = 0.024;
-    cam.position         = vec3f(0.f, 0.f,  1.0f);
+    cam.position         = vec3f(0.f, 0.0f,  4.5f);
     cam.width_px  = 600;
     cam.height_px = 400;
 
@@ -195,18 +228,23 @@ int main() {
     // Eye rays
     RayBuffer rb;
     allocRayBuffer(rb, N);
-    generateEyeRays(cam, samples, Basis{}, rb);
+    Basis bas;
+    bas.x = vec3f(1, 0, 0);
+    bas.y = vec3f(0, 1, 0);
+    bas.z = vec3f(0, 0, 1);
+
+    generateEyeRays(cam, samples, bas, rb);
 
     // Framebuffer
     Framebuffer fb;
     fb.pixels.resize(N * 3);
 
     // Trace
-    traceAndShade(scene, rb, fb);
+    traceAndShade(scene, matID, rb, fb);
 
-    // write EXR
-    writeEXR(fb, W, H, "render.exr");
-    printf("Wrote render.exr (%ux%u)\n", W, H);
+    // write PNG
+    writePNG(fb, W, H, "render.png");
+    printf("Wrote render.png (%ux%u)\n", W, H);
 
     freeRayBuffer(rb);
     freeSensorSamples(samples);

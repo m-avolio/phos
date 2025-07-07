@@ -1,13 +1,7 @@
 #include "sensor.h"
 
-#define TINYEXR_USE_MINIZ 0
-#ifndef TINYEXR_IMPLEMENTATION
-#define TINYEXR_IMPLEMENTATION
-#endif
-
-#include "zlib.h"
-#include "tinyexr.h"
-
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 void generateSensorSamples(std::uint32_t width_px,
                            std::uint32_t height_px,
@@ -30,41 +24,15 @@ void generateSensorSamples(std::uint32_t width_px,
                                   top  - (y + 0.5f) * dy };
 }
 
-bool writeEXR(const Framebuffer& fb, uint32_t W, uint32_t H, const char* path) {
-    EXRHeader hdr;  InitEXRHeader(&hdr);
-    EXRImage  img;  InitEXRImage (&img);
-
-    img.num_channels = 3;
-    std::vector<float> r(W*H), g(W*H), b(W*H);
-    for (size_t i = 0; i < W*H; ++i) {
-        r[i] = fb.pixels[i*3+0];
-        g[i] = fb.pixels[i*3+1];
-        b[i] = fb.pixels[i*3+2];
+bool writePNG(const Framebuffer& fb, uint32_t W, uint32_t H, const char* path) {
+    std::vector<unsigned char> img;
+    img.resize(size_t(W) * H * 3);
+    for (size_t i = 0, n = img.size(); i < n; ++i) {
+        float p = fb.pixels[i] * 255.0f;
+        float v = std::clamp(p, 0.0f, 255.0f);
+        img[i] = static_cast<unsigned char>(v + 0.5f);
     }
-    float* chan[3] = { b.data(), g.data(), r.data() };
-    img.images = reinterpret_cast<unsigned char**>(chan);
-    img.width  = W;
-    img.height = H;
 
-    hdr.num_channels = 3;
-    hdr.channels = (EXRChannelInfo*)malloc(sizeof(EXRChannelInfo)*3);
-    strncpy(hdr.channels[0].name, "B", 255);
-    strncpy(hdr.channels[1].name, "G", 255);
-    strncpy(hdr.channels[2].name, "R", 255);
-
-    hdr.pixel_types           = (int*)malloc(sizeof(int)*3);
-    hdr.requested_pixel_types = (int*)malloc(sizeof(int)*3);
-    for (int i=0;i<3;++i)
-        hdr.pixel_types[i] = hdr.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
-
-    const char* err;
-    int ret = SaveEXRImageToFile(&img, &hdr, path, &err);
-    if (ret != TINYEXR_SUCCESS) {
-        fprintf(stderr,"TinyEXR: %s\n", err);
-        FreeEXRErrorMessage(err);
-        return false;
-    }
-    free(hdr.channels); free(hdr.pixel_types); free(hdr.requested_pixel_types);
-    return true;
+    int stride = W * 3;
+    return stbi_write_png(path, W, H, 3, img.data(), stride) != 0;
 }
-

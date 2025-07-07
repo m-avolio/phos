@@ -30,4 +30,4 @@ void generateSensorSamples(std::uint32_t width_px,
                            float height,
                            SensorSamples& samples);
 
-bool writeEXR(const Framebuffer& fb, uint32_t W, uint32_t H, const char* path);
+bool writePNG(const Framebuffer& fb, uint32_t W, uint32_t H, const char* path);
