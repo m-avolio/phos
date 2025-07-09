@@ -67,8 +67,8 @@ f 11/1 6/1 8/1
 f 11/1 8/1 12/1
 g light
 usemtl light
-f 3/1 4/1 2/1
-f 3/1 2/1 1/1
+f 2/1 4/1 3/1
+f 1/1 2/1 3/1
 g white
 usemtl white
 f 7/1 8/1 6/1

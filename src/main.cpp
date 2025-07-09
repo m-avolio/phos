@@ -20,8 +20,10 @@
 
 static constexpr float EPSILON = 1e-5;
 static constexpr int MAX_DEPTH = 5;
-static constexpr int LIGHT_SAMPLES = 100;
+static constexpr int LIGHT_SAMPLES = 1000;
 
+inline RTCDevice device = nullptr;
+inline RTCScene scene = nullptr;
 
 // DEBUG Purposes, remove later or find a better way
 #define DEBUG
@@ -48,22 +50,17 @@ struct Material {
     std::vector<bool> emissive;
 };
 
-struct Verts {
-    std::vector<uint32_t*> iBuf;
-    std::vector<float*> vBuf;
-    std::vector<float*> nBuf;
-};
-
 struct EmissiveTri {
     uint32_t geomID;
     uint32_t primID;
+    const uint32_t* index;
+    const float* vertex;
     float area;
     float power;
     vec3f Le;
 };
 
 // Globals
-inline Verts verts;
 inline Material mats;
 inline std::vector<EmissiveTri> emissives;
 std::mt19937 rng{ 42 };
@@ -82,7 +79,7 @@ RTCDevice initializeDevice() {
   return device;
 }
 
-static RTCScene buildSceneFromOBJ(RTCDevice device, const std::string& objPath) {
+void buildSceneFromOBJ(const std::string& objPath) {
     // Get base dir path
     std::filesystem::path baseDir = std::filesystem::path{objPath}.parent_path();
 
@@ -117,7 +114,7 @@ static RTCScene buildSceneFromOBJ(RTCDevice device, const std::string& objPath) 
     mats.emissive.resize(N);
     mats.specular.resize(N);
 
-    RTCScene scene = rtcNewScene(device);
+    scene = rtcNewScene(device);
 
     for (size_t s = 0; s < shapes.size(); ++s) {
         const auto& mesh = shapes[s].mesh;
@@ -157,29 +154,48 @@ static RTCScene buildSceneFromOBJ(RTCDevice device, const std::string& objPath) 
                     attrib.vertices.data(),
                     attrib.vertices.size()*sizeof(float));
 
-        rtcSetGeometryVertexAttributeCount(geom, 1);
 
         // Normals
-        float* nBuf = nullptr;
+        rtcSetGeometryVertexAttributeCount(geom, 1);
         if (!attrib.normals.empty()) {
-            nBuf = static_cast<float*>(rtcSetNewGeometryBuffer(geom,
-                RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE,
-                0, 
-                RTC_FORMAT_FLOAT3,
-                3*sizeof(float),
-                numVerts));
+            float* nBuf = static_cast<float*>(rtcSetNewGeometryBuffer(
+                                    geom,
+                                    RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE,
+                                    0, 
+                                    RTC_FORMAT_FLOAT3,
+                                    3 * sizeof(float),
+                                    numVerts));
 
-            std::memcpy(nBuf,
-                        attrib.normals.data(),
-                        attrib.normals.size()*sizeof(float));
+                for (size_t f = 0; f < mesh.indices.size(); f += 3) {
+                    for (int k = 0; k < 3; ++k) {
+                        const auto& idx = mesh.indices[f + k];
+
+                        int vi = idx.vertex_index;
+                        int ni = idx.normal_index;
+                        if (ni < 0) {
+                            printf("here"); 
+                            continue;
+                        }
+
+                        nBuf[3*vi + 0] = attrib.normals[3*ni + 0];
+                        nBuf[3*vi + 1] = attrib.normals[3*ni + 1];
+                        nBuf[3*vi + 2] = attrib.normals[3*ni + 2];
+                    }
+                }
+        } else {
+            static const vec3f zero = vec3f{0};
+            rtcSetSharedGeometryBuffer(
+                geom,
+                RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 0,
+                RTC_FORMAT_FLOAT3,
+                zero,
+                0,
+                0,
+                1);
         }
 
         rtcCommitGeometry(geom);
         uint32_t geomID = rtcAttachGeometry(scene, geom);
-        // Add geometry pointers to array
-        verts.iBuf.push_back(iBuf);
-        verts.vBuf.push_back(vBuf);
-        verts.nBuf.push_back(nBuf);
 
         // Assuming one material ID per geom
         if (!materials.empty()) {
@@ -190,29 +206,23 @@ static RTCScene buildSceneFromOBJ(RTCDevice device, const std::string& objPath) 
             mats.emissive[geomID] = false; // This might not be a good idea
             bool isLight = (material.emission[0] > 0.0f || material.emission[1] > 0.0f || material.emission[2] > 0.0f); // could cause crash
             if (isLight) {
+                printf("islight");
                 mats.emissive[geomID] = true;
-                vec3f Le = vec3f(material.emission); 
-                std::cout << Le << std::endl;
                 const size_t numTris = numIndices / 3;
+                vec3f Le = vec3f(material.emission); 
                 for (uint32_t t = 0; t < numTris; ++t) {
-                    // Calculate Area
-                    uint32_t i0 = mesh.indices[3*t + 0].vertex_index;
-                    uint32_t i1 = mesh.indices[3*t + 1].vertex_index;
-                    uint32_t i2 = mesh.indices[3*t + 2].vertex_index;
 
-                    vec3f p0{ attrib.vertices[3*i0 + 0],
-                            attrib.vertices[3*i0 + 1],
-                            attrib.vertices[3*i0 + 2] };
-                    vec3f p1{ attrib.vertices[3*i1 + 0],
-                            attrib.vertices[3*i1 + 1],
-                            attrib.vertices[3*i1 + 2] };
-                    vec3f p2{ attrib.vertices[3*i2 + 0],
-                            attrib.vertices[3*i2 + 1],
-                            attrib.vertices[3*i2 + 2] };
+                    // Calculate Area
+                    uint32_t i0 = iBuf[3*t + 0];
+                    uint32_t i1 = iBuf[3*t + 1];
+                    uint32_t i2 = iBuf[3*t + 2];
+
+                    vec3f p0{vBuf[3*i0 + 0], vBuf[3*i0 + 1], vBuf[3*i0 + 2]};
+                    vec3f p1{vBuf[3*i1 + 0], vBuf[3*i1 + 1], vBuf[3*i1 + 2]};
+                    vec3f p2{vBuf[3*i2 + 0], vBuf[3*i2 + 1], vBuf[3*i2 + 2]};
 
                     float area = 0.5f * length(cross(p1 - p0, p2 - p0));
-
-                    emissives.push_back(EmissiveTri{geomID, t, area, area * dot(Le, vec3f(0.3333f)), Le});
+                    emissives.push_back(EmissiveTri{geomID, t, iBuf, vBuf, area, area * dot(Le, vec3f(0.3333f)), Le/(float(pi)*area)}); //TODO: Should I divide by pi*area?
                 }
             }
         } else { // default material
@@ -225,8 +235,8 @@ static RTCScene buildSceneFromOBJ(RTCDevice device, const std::string& objPath) 
     }
 
     rtcCommitScene(scene);
-    return scene;
 }
+
 vec3f reflect(vec3f wi, vec3f n) {
     return -2 * (dot(wi, n)) * n + wi;
 }
@@ -238,17 +248,18 @@ vec2f UniformSampleTriangle(const vec2f &u) {
 }
 
 inline void getTriangleVerts(const EmissiveTri& tri,
-                             vec3f& p0, vec3f& p1, vec3f& p2) {
-    const uint32_t* index = verts.iBuf[tri.geomID];
-    const float* v = verts.vBuf[tri.geomID];
+                             vec3f& p0, vec3f& p1, vec3f& p2)
+{
+    const uint32_t* i = tri.index;
+    const float*    v = tri.vertex;
 
-    const uint32_t i0 = index[3*tri.primID + 0];
-    const uint32_t i1 = index[3*tri.primID + 1];
-    const uint32_t i2 = index[3*tri.primID + 2];
+    uint32_t i0 = i[3*tri.primID + 0];
+    uint32_t i1 = i[3*tri.primID + 1];
+    uint32_t i2 = i[3*tri.primID + 2];
 
-    p0 = vec3f(v[3*i0 + 0], v[3*i0 + 1], v[3*i0 + 2]);
-    p1 = vec3f(v[3*i1 + 0], v[3*i1 + 1], v[3*i1 + 2]);
-    p2 = vec3f(v[3*i2 + 0], v[3*i2 + 1], v[3*i2 + 2]);
+    p0 = vec3f{ v[3*i0 + 0], v[3*i0 + 1], v[3*i0 + 2] };
+    p1 = vec3f{ v[3*i1 + 0], v[3*i1 + 1], v[3*i1 + 2] };
+    p2 = vec3f{ v[3*i2 + 0], v[3*i2 + 1], v[3*i2 + 2] };
 }
 
 struct LightSample {
@@ -274,12 +285,7 @@ inline vec2f randomVec2f() {
     return vec2f{uni(rng), uni(rng)};
 }
 
-// inline void fillRayHit(rtcRayHit &ray) {
-
-// }
-
-vec3f traceRay(RTCScene scene,
-               RTCRayQueryContext &qctx,
+vec3f traceRay(RTCRayQueryContext &qctx,
                RTCIntersectArguments &iargs,
                RTCRayHit rayhit,
                int depth) {
@@ -308,6 +314,16 @@ vec3f traceRay(RTCScene scene,
              rayhit.hit.Ng_z }
     );
 
+    // Shading Normal
+    vec3f Ns = Ng;
+    vec3f NsBuf = vec3f{0.0f};
+    RTCGeometry geometry = rtcGetGeometry(scene, geomID);
+    rtcInterpolate0(geometry, rayhit.hit.primID, rayhit.hit.u, rayhit.hit.v, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 0, NsBuf, 3);
+
+    if (NsBuf[0] || NsBuf[1] || NsBuf[2]) { Ns = normalize(vec3f{NsBuf[0], NsBuf[1], NsBuf[2]}); }
+
+    if (dot(Ns, Ng) < 0.0f) { Ns = -Ns; }
+
     vec3f wi = normalize(vec3f{
         rayhit.ray.dir_x,
         rayhit.ray.dir_y,
@@ -320,11 +336,12 @@ vec3f traceRay(RTCScene scene,
         rayhit.ray.org_y + wi.y * rayhit.ray.tfar + Ng.y * EPSILON,
         rayhit.ray.org_z + wi.z * rayhit.ray.tfar + Ng.z * EPSILON
     };
+
     if (mats.specular[geomID]) {
-        vec3f wr = reflect(wi, Ng);
+        vec3f wr = reflect(wi, Ns);
         // build new RTCRayHit
         RTCRayHit newRH = makeRayHit(org, wr, 0);
-        return mats.albedo[geomID] * traceRay(scene, qctx, iargs, newRH, depth + 1);
+        return mats.albedo[geomID] * traceRay(qctx, iargs, newRH, depth + 1);
     } else if (mats.emissive[geomID]) {
         return mats.albedo[geomID];
     } else {
@@ -338,8 +355,8 @@ vec3f traceRay(RTCScene scene,
                 RTCRayHit shadowRH = makeRayHit(org, normalize(wi), 0, dist-EPSILON);  //do not intersect with light
                 rtcIntersect1(scene, &shadowRH, &iargs); // It would be better to use the built in shadow ray stuff
                 if (shadowRH.hit.geomID != RTC_INVALID_GEOMETRY_ID) {continue;} // shadowed
-                float cosSurface = std::max(0.f, dot(Ng,  wi));
-                float cosLight   = std::max(0.f, dot(-sample.Ng, -wi)); // TODO: look into the normal for the light, not sure if this is good
+                float cosSurface = std::max(0.f, dot(Ns,  wi));
+                float cosLight   = std::max(0.f, dot(sample.Ng, -wi)); // TODO: look into the normal for the light, not sure if this is good
                 if (cosSurface == 0.f || cosLight == 0.f) {continue;}     
                 float G = (cosSurface * cosLight) / (dist*dist);
                 vec3f contrib = light.Le * G / sample.pdf;
@@ -350,10 +367,7 @@ vec3f traceRay(RTCScene scene,
     }
 }
 
-void traceAndShade(RTCScene scene,
-                   RayBuffer& rb,
-                   Framebuffer& fb)
-{
+void traceAndShade(RayBuffer& rb, Framebuffer& fb) {
     RTCRayQueryContext qctx;
     rtcInitRayQueryContext(&qctx);
 
@@ -364,7 +378,7 @@ void traceAndShade(RTCScene scene,
 
     for (size_t i = 0; i < rb.count; ++i) {
         // call our recursive helper with depth=0
-        vec3f col = traceRay(scene, qctx, iargs, rb.rh[i], 0);
+        vec3f col = traceRay(qctx, iargs, rb.rh[i], 0);
 
         float* px = &fb.pixels[rb.pixel[i] * 3];
         px[0] = col.x;
@@ -383,8 +397,8 @@ int main(int argc, char** argv) {
     const std::string objPath = argv[1];
 
     /* Setup device + scene */
-    RTCDevice device = initializeDevice();
-    RTCScene  scene  = buildSceneFromOBJ(device, objPath);
+    device = initializeDevice();
+    buildSceneFromOBJ(objPath);
 
     // Camera
     Camera cam;
@@ -392,8 +406,8 @@ int main(int argc, char** argv) {
     cam.width            = 0.036f;
     cam.height           = 0.024;
     cam.position         = vec3f(0.f, 0.0f,  2.5f);
-    cam.width_px  = 1200;
-    cam.height_px = 800;
+    cam.width_px  = 1800;
+    cam.height_px = 1200;
 
     const uint32_t W = cam.width_px;
     const uint32_t H = cam.height_px;
@@ -420,7 +434,7 @@ int main(int argc, char** argv) {
 
     #ifdef DEBUG
     auto t0 = std::chrono::high_resolution_clock::now();
-    traceAndShade(scene, rb, fb);
+    traceAndShade(rb, fb);
     auto t1 = std::chrono::high_resolution_clock::now();
 
     std::chrono::duration<double> dt = t1 - t0;
