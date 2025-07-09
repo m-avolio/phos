@@ -39,6 +39,35 @@ inline void freeRayBuffer(RayBuffer& r) {
     r = {};
 }
 
+inline RTCRayHit makeRayHit(const rkcommon::math::vec3f& org,
+                            const rkcommon::math::vec3f& dir,
+                            float tnear = 1e-3f,
+                            float tfar  = std::numeric_limits<float>::infinity(),
+                            unsigned mask = 0xFFFFFFFFu,
+                            float time = 0.f) {
+    RTCRayHit rh;
+    rh.ray.org_x = org.x;
+    rh.ray.org_y = org.y;
+    rh.ray.org_z = org.z;
+
+    rh.ray.dir_x = dir.x;
+    rh.ray.dir_y = dir.y;
+    rh.ray.dir_z = dir.z;
+
+    rh.ray.tnear = tnear;
+    rh.ray.tfar  = tfar;
+    rh.ray.mask  = mask;
+    rh.ray.time  = time;
+    rh.ray.id    = 0;
+    rh.ray.flags = 0;
+
+    rh.hit.geomID    = RTC_INVALID_GEOMETRY_ID;
+    rh.hit.primID    = RTC_INVALID_GEOMETRY_ID;
+    rh.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+
+    return rh;
+}
+
 void generateEyeRays(const Camera& cam,
                      const SensorSamples& samples,
                      const Basis& basis,
