@@ -1,8 +1,10 @@
 #include <embree4/rtcore.h>
+#include <embree4/rtcore_ray.h>
 #include <stdio.h>
 #include <math.h>
 #include <limits>
 #include <random>
+#include <atomic>
 #include <filesystem>
 #include <chrono>
 #include <complex>
@@ -19,6 +21,23 @@
 static constexpr float EPSILON = 1e-5;
 static constexpr int MAX_DEPTH = 5;
 static constexpr int LIGHT_SAMPLES = 100;
+
+
+// DEBUG Purposes, remove later or find a better way
+#define DEBUG
+#ifdef DEBUG
+inline std::atomic<uint64_t> rayTraversals{0};
+inline void rtcIntersect1Count(
+        RTCScene                 scene,
+        RTCRayHit*               rayhit,
+        RTCIntersectArguments*   args)
+{
+    rayTraversals.fetch_add(1, std::memory_order_relaxed);
+    rtcIntersect1(scene, rayhit, args);
+}
+
+#define rtcIntersect1  rtcIntersect1Count
+#endif
 
 using namespace rkcommon::math;
 
@@ -176,7 +195,7 @@ static RTCScene buildSceneFromOBJ(RTCDevice device, const std::string& objPath) 
                 std::cout << Le << std::endl;
                 const size_t numTris = numIndices / 3;
                 for (uint32_t t = 0; t < numTris; ++t) {
-                    // ---- gather the three positions --------------------------------
+                    // Calculate Area
                     uint32_t i0 = mesh.indices[3*t + 0].vertex_index;
                     uint32_t i1 = mesh.indices[3*t + 1].vertex_index;
                     uint32_t i2 = mesh.indices[3*t + 2].vertex_index;
@@ -191,10 +210,8 @@ static RTCScene buildSceneFromOBJ(RTCDevice device, const std::string& objPath) 
                             attrib.vertices[3*i2 + 1],
                             attrib.vertices[3*i2 + 2] };
 
-                    // ---- geometric area --------------------------------------------
                     float area = 0.5f * length(cross(p1 - p0, p2 - p0));
 
-                    // ---- store one light record per triangle -----------------------
                     emissives.push_back(EmissiveTri{geomID, t, area, area * dot(Le, vec3f(0.3333f)), Le});
                 }
             }
@@ -401,18 +418,20 @@ int main(int argc, char** argv) {
     Framebuffer fb;
     fb.pixels.resize(N * 3);
 
-    // --- TIMING START ---
+    #ifdef DEBUG
     auto t0 = std::chrono::high_resolution_clock::now();
     traceAndShade(scene, rb, fb);
     auto t1 = std::chrono::high_resolution_clock::now();
-    // --- TIMING END ---
 
     std::chrono::duration<double> dt = t1 - t0;
     double seconds = dt.count();
-    double mrays_per_s = (double)N / seconds / 1e6;
+    double mrays_per_s = (double)rayTraversals / seconds / 1e6;
 
     std::printf("Rendered %zu rays in %.3f s → %.2f Mrays/s\n",
                 N, seconds, mrays_per_s);
+    #elif
+    traceAndShade(scene, rb, fb);
+    #endif
 
     // write PNG
     writePNG(fb, W, H, "render.png");
