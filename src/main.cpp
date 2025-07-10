@@ -37,8 +37,17 @@ inline void rtcIntersect1Count(
     rayTraversals.fetch_add(1, std::memory_order_relaxed);
     rtcIntersect1(scene, rayhit, args);
 }
+inline void rtcOccluded1Count(
+        RTCScene                 scene,
+        RTCRay*                  ray,
+        RTCOccludedArguments*    args)
+{
+    rayTraversals.fetch_add(1, std::memory_order_relaxed);
+    rtcOccluded1(scene, ray, args);
+}
 
 #define rtcIntersect1  rtcIntersect1Count
+#define rtcOccluded1   rtcOccluded1Count
 #endif
 
 using namespace rkcommon::math;
@@ -352,9 +361,9 @@ vec3f traceRay(RTCRayQueryContext &qctx,
                 LightSample sample = EmissiveTriSample(light, randomVec2f());
                 vec3f wi = sample.point - org;
                 float dist = length(wi);
-                RTCRayHit shadowRH = makeRayHit(org, normalize(wi), 0, dist-EPSILON);  //do not intersect with light
-                rtcIntersect1(scene, &shadowRH, &iargs); // It would be better to use the built in shadow ray stuff
-                if (shadowRH.hit.geomID != RTC_INVALID_GEOMETRY_ID) {continue;} // shadowed
+                RTCRay shadowRay = makeRay(org, normalize(wi), 0, dist-EPSILON);  //do not intersect with light
+                rtcOccluded1(scene, &shadowRay, NULL);
+                if (shadowRay.tfar < EPSILON) {continue;} // shadowed
                 float cosSurface = std::max(0.f, dot(Ns,  wi));
                 float cosLight   = std::max(0.f, dot(sample.Ng, -wi)); // TODO: look into the normal for the light, not sure if this is good
                 if (cosSurface == 0.f || cosLight == 0.f) {continue;}     

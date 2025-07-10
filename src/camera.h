@@ -39,6 +39,32 @@ inline void freeRayBuffer(RayBuffer& r) {
     r = {};
 }
 
+inline RTCRay makeRay(const rkcommon::math::vec3f& org,
+                            const rkcommon::math::vec3f& dir,
+                            float tnear = 1e-3f,
+                            float tfar  = std::numeric_limits<float>::infinity(),
+                            unsigned mask = 0xFFFFFFFFu,
+                            float time = 0.f) {
+    RTCRay ray;
+    ray.org_x = org.x;
+    ray.org_y = org.y;
+    ray.org_z = org.z;
+
+    ray.dir_x = dir.x;
+    ray.dir_y = dir.y;
+    ray.dir_z = dir.z;
+
+    ray.tnear = tnear;
+    ray.tfar  = tfar;
+    ray.mask  = mask;
+    ray.time  = time;
+    ray.id    = 0;
+    ray.flags = 0;
+
+    return ray;
+}
+
+
 inline RTCRayHit makeRayHit(const rkcommon::math::vec3f& org,
                             const rkcommon::math::vec3f& dir,
                             float tnear = 1e-3f,
@@ -46,20 +72,7 @@ inline RTCRayHit makeRayHit(const rkcommon::math::vec3f& org,
                             unsigned mask = 0xFFFFFFFFu,
                             float time = 0.f) {
     RTCRayHit rh;
-    rh.ray.org_x = org.x;
-    rh.ray.org_y = org.y;
-    rh.ray.org_z = org.z;
-
-    rh.ray.dir_x = dir.x;
-    rh.ray.dir_y = dir.y;
-    rh.ray.dir_z = dir.z;
-
-    rh.ray.tnear = tnear;
-    rh.ray.tfar  = tfar;
-    rh.ray.mask  = mask;
-    rh.ray.time  = time;
-    rh.ray.id    = 0;
-    rh.ray.flags = 0;
+    rh.ray = makeRay(org, dir, tnear, tfar, mask, time);
 
     rh.hit.geomID    = RTC_INVALID_GEOMETRY_ID;
     rh.hit.primID    = RTC_INVALID_GEOMETRY_ID;
