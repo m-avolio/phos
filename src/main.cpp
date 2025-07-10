@@ -27,27 +27,24 @@ inline RTCDevice device = nullptr;
 inline RTCScene scene = nullptr;
 
 // DEBUG Purposes, remove later or find a better way
+#define DEBUG
 #ifdef DEBUG
 inline std::atomic<uint64_t> rayTraversals{0};
-inline void rtcIntersect1Count(
-        RTCScene                 scene,
-        RTCRayHit*               rayhit,
-        RTCIntersectArguments*   args)
+inline thread_local uint64_t tlsRays = 0;
+
+inline void rtcIntersect1Count(RTCScene s, RTCRayHit* rh, RTCIntersectArguments* a)
 {
-    rayTraversals.fetch_add(1, std::memory_order_relaxed);
-    rtcIntersect1(scene, rayhit, args);
+    ++tlsRays;
+    rtcIntersect1(s, rh, a);
 }
-inline void rtcOccluded1Count(
-        RTCScene                 scene,
-        RTCRay*                  ray,
-        RTCOccludedArguments*    args)
+inline void rtcOccluded1Count(RTCScene s, RTCRay* r, RTCOccludedArguments* a)
 {
-    rayTraversals.fetch_add(1, std::memory_order_relaxed);
-    rtcOccluded1(scene, ray, args);
+    ++tlsRays;
+    rtcOccluded1(s, r, a);
 }
 
-#define rtcIntersect1  rtcIntersect1Count
-#define rtcOccluded1   rtcOccluded1Count
+#define rtcIntersect1 rtcIntersect1Count
+#define rtcOccluded1  rtcOccluded1Count
 #endif
 
 using namespace rkcommon::math;
@@ -409,7 +406,7 @@ int main(int argc, char** argv) {
     const uint32_t H = cam.height_px;
     const size_t   N = size_t(W) * H * SPP;
 
-
+    static_assert((SPP & 3) == 0, "SPP must be divisible by 4 for rtcIntersect4");
     // Eye rays
     Basis bas;
     bas.x = vec3f(1, 0, 0);
@@ -475,6 +472,9 @@ int main(int argc, char** argv) {
                 if (id >= tiles.size()) break;
                 renderTile(tiles[id]);
             }
+        #ifdef DEBUG
+        rayTraversals.fetch_add(tlsRays, std::memory_order_relaxed);
+        #endif
         });
 
     for (auto& th : pool) th.join();
@@ -486,7 +486,7 @@ int main(int argc, char** argv) {
     double mrays_per_s = (double)rayTraversals / seconds / 1e6;
 
     std::printf("Rendered %zu rays in %.3f s → %.2f Mrays/s\n",
-                rayTraversals, seconds, mrays_per_s);
+                (size_t)rayTraversals, seconds, mrays_per_s);
     #else
     std::printf("Rendered in %.3f s\n", seconds);
     #endif
