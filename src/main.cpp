@@ -297,6 +297,39 @@ inline vec2f randomVec2f() {
     return vec2f{uni(rng), uni(rng)};
 }
 
+
+// Revall Frisvad 2012
+inline void frisvad(const vec3f& n, vec3f& b1, vec3f& b2) {
+    if(n.z < -0.9999999f) { // Handle the singularity
+        b1 = vec3f( 0.0f, -1.0f, 0.0f); b2 = vec3f(-1.0f, 0.0f, 0.0f); return;
+    }
+    const float a = 1.0f/(1.0f + n.z); const float b = -n.x*n.y*a;
+    b1 = vec3f(1.0f - n.x*n.x*a, b, -n.x); b2 = vec3f(b, 1.0f - n.y*n.y*a, -n.y);
+}
+
+// PBRT 
+vec2f concentricSampleDisk(const vec2f &u) {
+    vec2f uOffset = 2.f * u - vec2f(1, 1);
+    if (uOffset.x == 0 && uOffset.y == 0) { return vec2f(0, 0); }
+    float theta, r;
+    if (std::abs(uOffset.x) > std::abs(uOffset.y)) {
+    r = uOffset.x;
+    theta = float(quarter_pi) * (uOffset.y / uOffset.x);
+    } else {
+        r = uOffset.y;
+        theta = float(half_pi) - float(quarter_pi) * (uOffset.x / uOffset.y);
+    }
+    return r * vec2f(std::cos(theta), std::sin(theta));
+}
+
+// PBRT 
+inline vec3f cosineSampleHemisphere(const vec2f &u) {
+    vec2f d = concentricSampleDisk(u);
+    float z = std::sqrt(std::max((float)0, 1 - d.x * d.x - d.y * d.y));
+    return vec3f(d.x, d.y, z);
+}
+
+
 vec3f traceRay(RTCRayQueryContext &qctx,
                RTCIntersectArguments &iargs,
                RTCRayHit rayhit,
@@ -336,7 +369,7 @@ vec3f traceRay(RTCRayQueryContext &qctx,
 
     if (dot(Ns, Ng) < 0.0f) { Ns = -Ns; }
 
-    vec3f wi = normalize(vec3f{
+    vec3f wo = normalize(vec3f{
         rayhit.ray.dir_x,
         rayhit.ray.dir_y,
         rayhit.ray.dir_z
@@ -344,15 +377,15 @@ vec3f traceRay(RTCRayQueryContext &qctx,
 
     // Move position in direction of geom normal 
     vec3f org = vec3f{
-        rayhit.ray.org_x + wi.x * rayhit.ray.tfar + Ng.x * EPSILON,
-        rayhit.ray.org_y + wi.y * rayhit.ray.tfar + Ng.y * EPSILON,
-        rayhit.ray.org_z + wi.z * rayhit.ray.tfar + Ng.z * EPSILON
+        rayhit.ray.org_x + wo.x * rayhit.ray.tfar + Ng.x * EPSILON,
+        rayhit.ray.org_y + wo.y * rayhit.ray.tfar + Ng.y * EPSILON,
+        rayhit.ray.org_z + wo.z * rayhit.ray.tfar + Ng.z * EPSILON
     };
 
     if (mats.specular[geomID]) {
-        vec3f wr = reflect(wi, Ns);
+        vec3f wi = reflect(wo, Ns);
         // build new RTCRayHit
-        RTCRayHit newRH = makeRayHit(org, wr, 0);
+        RTCRayHit newRH = makeRayHit(org, wi, 0);
         return mats.albedo[geomID] * traceRay(qctx, iargs, newRH, depth + 1);
     } else if (mats.emissive[geomID]) {
         return mats.albedo[geomID];
@@ -360,19 +393,33 @@ vec3f traceRay(RTCRayQueryContext &qctx,
         // sample every light
         vec3f Li = vec3f{0};
         for (auto light: emissives) {
-            for (int i = 0; i < LIGHT_SAMPLES; ++i) {
-                LightSample sample = EmissiveTriSample(light, org, randomVec2f());
-                if (sample.pdf == 0.f) {continue;};
-                RTCRay shadowRay = makeRay(org, sample.wi, 0, sample.dist-EPSILON);  //do not intersect with light
-                rtcOccluded1(scene, &shadowRay, NULL);
-                if (shadowRay.tfar < EPSILON) {continue;} // shadowed
-                float cosSurface = std::max(0.f, dot(Ns,  sample.wi));
-                if (cosSurface == 0.f) {continue;}     
-                vec3f contrib = light.Le * cosSurface / sample.pdf;
-                Li += contrib / LIGHT_SAMPLES;
-            }
+            LightSample sample = EmissiveTriSample(light, org, randomVec2f());
+            if (sample.pdf == 0.f) {continue;};
+            RTCRay shadowRay = makeRay(org, sample.wi, 0, sample.dist-EPSILON);  //do not intersect with light
+            rtcOccluded1(scene, &shadowRay, NULL);
+            if (shadowRay.tfar < EPSILON) {continue;} // shadowed
+            float cosTheta = std::max(0.f, dot(Ns,  sample.wi));
+            if (cosTheta == 0.f) {continue;}     
+            vec3f contrib = light.Le * cosTheta / sample.pdf;
+            Li += contrib;
         }
-        return mats.albedo[geomID] * Li * float(one_over_pi);
+        float numSamples = emissives.size();
+        // Cosine weighted hemisphere sampling
+        vec3f h = cosineSampleHemisphere(randomVec2f());
+        // Transform to world space
+        vec3f b1, b2;
+        frisvad(Ns, b1, b2);
+        vec3f wi = h.x*b1 + h.y*b2 + h.z * Ns;
+        float cosTheta = h.z;
+        float pdf = cosTheta * float(one_over_pi);
+
+        if (pdf > 0.f) {
+            float pdf = cosTheta * float(one_over_pi);
+            RTCRayHit newRH = makeRayHit(org, wi, 0);
+            Li += traceRay(qctx, iargs, newRH, depth + 1) / pdf;
+            ++numSamples;
+        }     
+        return mats.albedo[geomID] * Li * float(one_over_pi) / numSamples;
     }
 }
 
@@ -399,13 +446,13 @@ int main(int argc, char** argv) {
     // Camera
     Camera cam;
     cam.focal_length     = 0.050f;
-    cam.width            = 0.036f;
+    cam.width            = 0.024;
     cam.height           = 0.024;
     cam.position         = vec3f(0.f, 0.0f,  2.5f);
     cam.width_px  = 1200;
-    cam.height_px = 800;
+    cam.height_px = 1200;
 
-    const uint32_t SPP = 1024;
+    const uint32_t SPP = 100*1024;
     const uint32_t W = cam.width_px;
     const uint32_t H = cam.height_px;
     const size_t   N = size_t(W) * H * SPP;
