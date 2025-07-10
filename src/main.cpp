@@ -20,7 +20,7 @@
 
 static constexpr float EPSILON = 1e-5;
 static constexpr int MAX_DEPTH = 5;
-static constexpr int LIGHT_SAMPLES = 1000;
+static constexpr int LIGHT_SAMPLES = 1;
 
 inline RTCDevice device = nullptr;
 inline RTCScene scene = nullptr;
@@ -376,7 +376,7 @@ vec3f traceRay(RTCRayQueryContext &qctx,
     }
 }
 
-void traceAndShade(RayBuffer& rb, Framebuffer& fb) {
+void traceAndShade(RayBuffer& rb, Framebuffer& fb, uint32_t spp) {
     RTCRayQueryContext qctx;
     rtcInitRayQueryContext(&qctx);
 
@@ -389,10 +389,12 @@ void traceAndShade(RayBuffer& rb, Framebuffer& fb) {
         // call our recursive helper with depth=0
         vec3f col = traceRay(qctx, iargs, rb.rh[i], 0);
 
+
+        float inv_spp = 1.0f/spp; 
         float* px = &fb.pixels[rb.pixel[i] * 3];
-        px[0] = col.x;
-        px[1] = col.y;
-        px[2] = col.z;
+        px[0] += col.x * inv_spp;
+        px[1] += col.y * inv_spp;
+        px[2] += col.z * inv_spp;
     }
 }
 
@@ -415,17 +417,18 @@ int main(int argc, char** argv) {
     cam.width            = 0.036f;
     cam.height           = 0.024;
     cam.position         = vec3f(0.f, 0.0f,  2.5f);
-    cam.width_px  = 1800;
-    cam.height_px = 1200;
+    cam.width_px  = 600;
+    cam.height_px = 400;
 
+    const uint32_t SPP = 128;
     const uint32_t W = cam.width_px;
     const uint32_t H = cam.height_px;
-    const size_t   N = size_t(W) * H;
+    const size_t   N = size_t(W) * H * SPP;
 
     // Film samples
     SensorSamples samples;            
     allocSensorSamples(samples, N);
-    generateSensorSamples(cam.width_px, cam.height_px, cam.width, cam.height, samples);
+    generateSensorSamples(cam.width_px, cam.height_px, cam.width, cam.height, SPP, samples);
 
     // Eye rays
     RayBuffer rb;
@@ -435,7 +438,7 @@ int main(int argc, char** argv) {
     bas.y = vec3f(0, 1, 0);
     bas.z = vec3f(0, 0, 1);
 
-    generateEyeRays(cam, samples, bas, rb);
+    generateEyeRays(cam, samples, bas, rb, SPP);
 
     // Framebuffer
     Framebuffer fb;
@@ -443,7 +446,7 @@ int main(int argc, char** argv) {
 
     #ifdef DEBUG
     auto t0 = std::chrono::high_resolution_clock::now();
-    traceAndShade(rb, fb);
+    traceAndShade(rb, fb, SPP);
     auto t1 = std::chrono::high_resolution_clock::now();
 
     std::chrono::duration<double> dt = t1 - t0;
@@ -453,7 +456,7 @@ int main(int argc, char** argv) {
     std::printf("Rendered %zu rays in %.3f s → %.2f Mrays/s\n",
                 N, seconds, mrays_per_s);
     #elif
-    traceAndShade(scene, rb, fb);
+    traceAndShade(rb, fb, SPP);
     #endif
 
     // write PNG

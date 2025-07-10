@@ -84,4 +84,5 @@ inline RTCRayHit makeRayHit(const rkcommon::math::vec3f& org,
 void generateEyeRays(const Camera& cam,
                      const SensorSamples& samples,
                      const Basis& basis,
-                     RayBuffer& rs);
+                     RayBuffer& rb,
+                     uint32_t spp);
