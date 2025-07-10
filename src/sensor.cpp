@@ -124,6 +124,31 @@ void generateSensorSamples(std::uint32_t width_px,
     }
 }
 
+void generateSamplesForPixel(uint32_t px, uint32_t py,
+                                    uint32_t imageW, uint32_t imageH,
+                                    float sensorW,  float sensorH,
+                                    uint32_t spp,
+                                    SensorSamples& samples) {
+    const float dx   = sensorW  / float(imageW);
+    const float dy   = sensorH  / float(imageH);
+    const float left = -0.5f * sensorW;
+    const float top  =  0.5f * sensorH;
+
+    uint32_t pixelSeed = (px * 0x1f1f1f1f) ^ (py * 0x5f356495); // Magic numbers that I don't understand
+
+    for (uint32_t s = 0; s < spp; ++s) {
+        rkcommon::math::vec2f u = cmj(s, spp, pixelSeed);
+
+        float sx = (float(px) + u.x) * dx;
+        float sy = (float(py) + u.y) * dy;
+
+        samples.points[s] = {
+            left + sx,
+            top  - sy
+        };
+    }
+}
+
 static float toneMapping(const float r) {
     // ACES Narkowicz 2016
     const float a = 2.51f;

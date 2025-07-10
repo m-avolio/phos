@@ -20,22 +20,16 @@ struct Camera {
 // Move eventually if I make a ray file
 struct RayBuffer {
     RTCRayHit* rh {};
-    uint32_t*  pixel {};
-    size_t     count {};
 };
 
 inline void allocRayBuffer(RayBuffer& r, size_t N) {
     constexpr size_t ALIGN = 64;
     r.rh    = static_cast<RTCRayHit*>( rkcommon::memory::alignedMalloc(
                                           N * sizeof(RTCRayHit), ALIGN));
-    r.pixel = static_cast<uint32_t*>(  rkcommon::memory::alignedMalloc(
-                                          N * sizeof(uint32_t), ALIGN));
-    r.count = N;
 }
 
 inline void freeRayBuffer(RayBuffer& r) {
     rkcommon::memory::alignedFree(r.rh);
-    rkcommon::memory::alignedFree(r.pixel);
     r = {};
 }
 
@@ -65,6 +59,7 @@ inline RTCRay makeRay(const rkcommon::math::vec3f& org,
 }
 
 
+// Move somewhere else
 inline RTCRayHit makeRayHit(const rkcommon::math::vec3f& org,
                             const rkcommon::math::vec3f& dir,
                             float tnear = 1e-3f,
@@ -81,8 +76,14 @@ inline RTCRayHit makeRayHit(const rkcommon::math::vec3f& org,
     return rh;
 }
 
-void generateEyeRays(const Camera& cam,
-                     const SensorSamples& samples,
-                     const Basis& basis,
-                     RayBuffer& rb,
-                     uint32_t spp);
+void generateRaysForPixel(const Camera& cam,
+                          const Basis&  bas,
+                          const SensorSamples& samp,
+                          uint32_t spp,
+                          RayBuffer& rb); 
+
+// void generateEyeRays(const Camera& cam,
+//                      const SensorSamples& samples,
+//                      const Basis& basis,
+//                      RayBuffer& rb,
+//                      uint32_t spp);

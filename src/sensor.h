@@ -31,4 +31,10 @@ void generateSensorSamples(std::uint32_t width_px,
                            std::uint32_t spp,
                            SensorSamples& samples);
 
+void generateSamplesForPixel(uint32_t px, uint32_t py,
+                                    uint32_t imageW, uint32_t imageH,
+                                    float sensorW,  float sensorH,
+                                    uint32_t spp,
+                                    SensorSamples& samples);
+
 bool writePNG(const Framebuffer& fb, uint32_t W, uint32_t H, const char* path);

@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <chrono>
 #include <complex>
+#include <thread>
 
 #include "rkcommon/math/vec.h"
 #include "rkcommon/memory/malloc.h"
@@ -26,7 +27,6 @@ inline RTCDevice device = nullptr;
 inline RTCScene scene = nullptr;
 
 // DEBUG Purposes, remove later or find a better way
-#define DEBUG
 #ifdef DEBUG
 inline std::atomic<uint64_t> rayTraversals{0};
 inline void rtcIntersect1Count(
@@ -215,7 +215,6 @@ void buildSceneFromOBJ(const std::string& objPath) {
             mats.emissive[geomID] = false; // This might not be a good idea
             bool isLight = (material.emission[0] > 0.0f || material.emission[1] > 0.0f || material.emission[2] > 0.0f); // could cause crash
             if (isLight) {
-                printf("islight");
                 mats.emissive[geomID] = true;
                 const size_t numTris = numIndices / 3;
                 vec3f Le = vec3f(material.emission); 
@@ -376,30 +375,15 @@ vec3f traceRay(RTCRayQueryContext &qctx,
     }
 }
 
-void traceAndShade(RayBuffer& rb, Framebuffer& fb, uint32_t spp) {
-    RTCRayQueryContext qctx;
-    rtcInitRayQueryContext(&qctx);
-
-    RTCIntersectArguments iargs;
-    rtcInitIntersectArguments(&iargs);
-    iargs.context = &qctx;
-    iargs.flags   = RTC_RAY_QUERY_FLAG_COHERENT;
-
-    for (size_t i = 0; i < rb.count; ++i) {
-        // call our recursive helper with depth=0
-        vec3f col = traceRay(qctx, iargs, rb.rh[i], 0);
-
-
-        float inv_spp = 1.0f/spp; 
-        float* px = &fb.pixels[rb.pixel[i] * 3];
-        px[0] += col.x * inv_spp;
-        px[1] += col.y * inv_spp;
-        px[2] += col.z * inv_spp;
-    }
+inline void addSample(Framebuffer& fb,
+                      size_t pixel, const vec3f& c, uint32_t spp) {
+    float* px = &fb.pixels[pixel * 3];
+    px[0] += c.x / float(spp);
+    px[1] += c.y / float(spp);
+    px[2] += c.z / float(spp);
 }
 
 /* -------------------------------------------------------------------------- */
-
 int main(int argc, char** argv) {
     if (argc < 2) {
         printf("Usage: %s scene.obj\n", argv[0]);
@@ -417,54 +401,100 @@ int main(int argc, char** argv) {
     cam.width            = 0.036f;
     cam.height           = 0.024;
     cam.position         = vec3f(0.f, 0.0f,  2.5f);
-    cam.width_px  = 600;
-    cam.height_px = 400;
+    cam.width_px  = 1200;
+    cam.height_px = 800;
 
-    const uint32_t SPP = 128;
+    const uint32_t SPP = 1024;
     const uint32_t W = cam.width_px;
     const uint32_t H = cam.height_px;
     const size_t   N = size_t(W) * H * SPP;
 
-    // Film samples
-    SensorSamples samples;            
-    allocSensorSamples(samples, N);
-    generateSensorSamples(cam.width_px, cam.height_px, cam.width, cam.height, SPP, samples);
 
     // Eye rays
-    RayBuffer rb;
-    allocRayBuffer(rb, N);
     Basis bas;
     bas.x = vec3f(1, 0, 0);
     bas.y = vec3f(0, 1, 0);
     bas.z = vec3f(0, 0, 1);
 
-    generateEyeRays(cam, samples, bas, rb, SPP);
-
     // Framebuffer
     Framebuffer fb;
-    fb.pixels.resize(N * 3);
+    fb.pixels.resize(W * H * 3);
 
-    #ifdef DEBUG
+    struct Tile { int x0, y0, x1, y1; };
+
+    auto renderTile = [&](const Tile& T) {
+        RTCRayQueryContext qctx;
+        rtcInitRayQueryContext(&qctx);
+
+        RTCIntersectArguments iargs;
+        rtcInitIntersectArguments(&iargs);
+        iargs.context = &qctx;
+        iargs.flags   = RTC_RAY_QUERY_FLAG_COHERENT;
+
+        SensorSamples pixSamples;   allocSensorSamples(pixSamples, SPP);
+        RayBuffer     pixRays;      allocRayBuffer    (pixRays,    SPP);
+        for (int y = T.y0; y < T.y1; ++y) {
+            for (int x = T.x0; x < T.x1; ++x) {
+                generateSamplesForPixel(x, y,
+                                        cam.width_px, cam.height_px,
+                                        cam.width,     cam.height,
+                                        SPP, pixSamples);
+
+                generateRaysForPixel(cam, bas, pixSamples, SPP, pixRays);
+
+                size_t pixelId = size_t(y) * W + x;
+                for (uint32_t s = 0; s < SPP; ++s) {
+                    vec3f col = traceRay(qctx, iargs, pixRays.rh[s], 0);
+                    addSample(fb, pixelId, col, SPP);
+                }
+            }
+        }
+        freeRayBuffer(pixRays);
+        freeSensorSamples(pixSamples);
+    };
+
+    /* --- build tile list -------------------------------------------------- */
     auto t0 = std::chrono::high_resolution_clock::now();
-    traceAndShade(rb, fb, SPP);
+    const int TILE = 32;
+    std::vector<Tile> tiles;
+    for (int y = 0; y < int(H); y += TILE)
+        for (int x = 0; x < int(W); x += TILE)
+            tiles.push_back({ x, y,
+                            std::min(x+TILE, int(W)),
+                            std::min(y+TILE, int(H)) });
+
+    /* --- launch threads --------------------------------------------------- */
+    std::atomic<size_t> next{0};
+    unsigned hw = std::thread::hardware_concurrency();
+    std::vector<std::thread> pool;
+
+    for (unsigned t = 0; t < hw; ++t)
+        pool.emplace_back([&] {
+            while (true) {
+                size_t id = next.fetch_add(1, std::memory_order_relaxed);
+                if (id >= tiles.size()) break;
+                renderTile(tiles[id]);
+            }
+        });
+
+    for (auto& th : pool) th.join();
     auto t1 = std::chrono::high_resolution_clock::now();
 
     std::chrono::duration<double> dt = t1 - t0;
     double seconds = dt.count();
+    #ifdef DEBUG
     double mrays_per_s = (double)rayTraversals / seconds / 1e6;
 
     std::printf("Rendered %zu rays in %.3f s → %.2f Mrays/s\n",
-                N, seconds, mrays_per_s);
-    #elif
-    traceAndShade(rb, fb, SPP);
+                rayTraversals, seconds, mrays_per_s);
+    #else
+    std::printf("Rendered in %.3f s\n", seconds);
     #endif
 
     // write PNG
     writePNG(fb, W, H, "render.png");
     printf("Wrote render.png (%ux%u)\n", W, H);
 
-    freeRayBuffer(rb);
-    freeSensorSamples(samples);
     rtcReleaseScene(scene);
     rtcReleaseDevice(device);
 
