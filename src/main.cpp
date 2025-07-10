@@ -227,7 +227,7 @@ void buildSceneFromOBJ(const std::string& objPath) {
                     vec3f p2{vBuf[3*i2 + 0], vBuf[3*i2 + 1], vBuf[3*i2 + 2]};
 
                     float area = 0.5f * length(cross(p1 - p0, p2 - p0));
-                    emissives.push_back(EmissiveTri{geomID, t, iBuf, vBuf, area, area * dot(Le, vec3f(0.3333f)), Le/(float(pi)*area)}); //TODO: Should I divide by pi*area?
+                    emissives.push_back(EmissiveTri{geomID, t, iBuf, vBuf, area, area * dot(Le, vec3f(0.3333f)), Le}); //TODO: Should I divide by pi*area?
                 }
             }
         } else { // default material
@@ -270,10 +270,12 @@ inline void getTriangleVerts(const EmissiveTri& tri,
 struct LightSample {
     vec3f point;
     vec3f Ng;
+    vec3f wi;
+    float dist;
     float pdf;
 };
 
-LightSample EmissiveTriSample(const EmissiveTri &tri, const vec2f &u) {
+LightSample EmissiveTriSample(const EmissiveTri &tri, const vec3f &origin, const vec2f &u) {
     // get triangle points
     vec3f p0, p1, p2;
     getTriangleVerts(tri, p0, p1, p2);
@@ -281,8 +283,13 @@ LightSample EmissiveTriSample(const EmissiveTri &tri, const vec2f &u) {
     vec2f b   = UniformSampleTriangle(u);
     vec3f point = b[0]*p0 + b[1]*p1 + (1.f-b[0]-b[1])*p2;
     vec3f Ng = normalize(cross(p1 - p0, p2 - p0));
-    float pdf = 1.f / tri.area;  // should double check to make sure this is correct
-    return LightSample{point, Ng, pdf}; 
+    vec3f wi = point - origin;
+    float dist = length(wi);
+    wi = normalize(wi);
+    float cos = std::max(0.f, dot(Ng,  -wi));
+    if (cos == 0) return LightSample{point, Ng, wi, dist, 0};
+    float pdf = (dist*dist) / (tri.area * cos);
+    return LightSample{point, Ng, wi, dist, pdf}; 
 }
 
 inline vec2f randomVec2f() {
@@ -354,17 +361,14 @@ vec3f traceRay(RTCRayQueryContext &qctx,
         vec3f Li = vec3f{0};
         for (auto light: emissives) {
             for (int i = 0; i < LIGHT_SAMPLES; ++i) {
-                LightSample sample = EmissiveTriSample(light, randomVec2f());
-                vec3f wi = sample.point - org;
-                float dist = length(wi);
-                RTCRay shadowRay = makeRay(org, normalize(wi), 0, dist-EPSILON);  //do not intersect with light
+                LightSample sample = EmissiveTriSample(light, org, randomVec2f());
+                if (sample.pdf == 0.f) {continue;};
+                RTCRay shadowRay = makeRay(org, sample.wi, 0, sample.dist-EPSILON);  //do not intersect with light
                 rtcOccluded1(scene, &shadowRay, NULL);
                 if (shadowRay.tfar < EPSILON) {continue;} // shadowed
-                float cosSurface = std::max(0.f, dot(Ns,  wi));
-                float cosLight   = std::max(0.f, dot(sample.Ng, -wi)); // TODO: look into the normal for the light, not sure if this is good
-                if (cosSurface == 0.f || cosLight == 0.f) {continue;}     
-                float G = (cosSurface * cosLight) / (dist*dist);
-                vec3f contrib = light.Le * G / sample.pdf;
+                float cosSurface = std::max(0.f, dot(Ns,  sample.wi));
+                if (cosSurface == 0.f) {continue;}     
+                vec3f contrib = light.Le * cosSurface / sample.pdf;
                 Li += contrib / LIGHT_SAMPLES;
             }
         }
@@ -450,7 +454,6 @@ int main(int argc, char** argv) {
         freeSensorSamples(pixSamples);
     };
 
-    /* --- build tile list -------------------------------------------------- */
     auto t0 = std::chrono::high_resolution_clock::now();
     const int TILE = 32;
     std::vector<Tile> tiles;
@@ -460,7 +463,6 @@ int main(int argc, char** argv) {
                             std::min(x+TILE, int(W)),
                             std::min(y+TILE, int(H)) });
 
-    /* --- launch threads --------------------------------------------------- */
     std::atomic<size_t> next{0};
     unsigned hw = std::thread::hardware_concurrency();
     std::vector<std::thread> pool;
