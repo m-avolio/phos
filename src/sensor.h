@@ -38,3 +38,5 @@ void generateSamplesForPixel(uint32_t px, uint32_t py,
                                     SensorSamples& samples);
 
 bool writePNG(const Framebuffer& fb, uint32_t W, uint32_t H, const char* path);
+
+rkcommon::math::vec2f cmj(int s, int N, int p, float a);

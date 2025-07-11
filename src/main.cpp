@@ -412,7 +412,7 @@ vec3f traceRay(RTCRayQueryContext &qctx,
                 rtcOccluded1(scene, &shadowRay, NULL);
 
                 if (shadowRay.tfar > 0.f) {                       // not shadowed
-                    float cosIn = std::max(0.f, dot(Ns, s.wi));
+                    float cosIn = dot(Ns, s.wi);
                     if (cosIn > 0.f) {
                         float pdfBSDF = cosIn * float(one_over_pi);   // competing pdf
                         float w       = powerHeuristic(1, pdfLight, 1, pdfBSDF);
@@ -445,15 +445,15 @@ vec3f traceRay(RTCRayQueryContext &qctx,
                 rh = makeRayHit(org, wi, 0);
 
                 rtcIntersect1(scene, &rh, &iargs);
-                if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
+                if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID) { 
                     for (const EmissiveTri &e : emissives) {
-                        if (e.geomID == rh.hit.geomID && e.primID == rh.hit.primID) {
+                        if (e.geomID == rh.hit.geomID && e.primID == rh.hit.primID) { // TODO: need a better way of checking if it hit an emissive
                             // we hit an emissive triangle: convert its area pdf to solid angle
                             vec3f p0, p1, p2;
                             getTriangleVerts(e, p0, p1, p2);
                             vec3f Ng   = normalize(cross(p1 - p0, p2 - p0));
                             float dist = rh.ray.tfar;
-                            float cosL = std::fabs(dot(Ng, -wi));
+                            float cosL = dot(Ng, -wi);
 
                             if (cosL > 0.f) {
                                 pdfLight = (dist * dist) / (e.area * cosL);
@@ -492,6 +492,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     const std::string objPath = argv[1];
+    /* TODO: - Change random number generation
+             - Make robust cosine
+    */
+
+
+             
 
     /* Setup device + scene */
     device = initializeDevice();
@@ -506,12 +512,12 @@ int main(int argc, char** argv) {
     cam.width_px  = 1200;
     cam.height_px = 1200;
 
-    const uint32_t SPP = 10*128;
+    const uint32_t SPP = 100*128;
     const uint32_t W = cam.width_px;
     const uint32_t H = cam.height_px;
     const size_t   N = size_t(W) * H * SPP;
 
-    static_assert((SPP & 3) == 0, "SPP must be divisible by 4 for rtcIntersect4");
+    static_assert((SPP & 3) == 0, "SPP must be divisible by 4 for rtcIntersect4"); //TODO
     // Eye rays
     Basis bas;
     bas.x = vec3f(1, 0, 0);
