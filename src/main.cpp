@@ -329,6 +329,11 @@ inline vec3f cosineSampleHemisphere(const vec2f &u) {
     return vec3f(d.x, d.y, z);
 }
 
+//PBRT
+inline float powerHeuristic(int nf, float fPdf, int ng, float gPdf) {
+    float f = nf * fPdf, g = ng * gPdf;
+    return (f * f) / (f * f + g * g);
+}
 
 vec3f traceRay(RTCRayQueryContext &qctx,
                RTCIntersectArguments &iargs,
@@ -390,36 +395,85 @@ vec3f traceRay(RTCRayQueryContext &qctx,
     } else if (mats.emissive[geomID]) {
         return mats.albedo[geomID];
     } else {
-        // sample every light
-        vec3f Li = vec3f{0};
-        for (auto light: emissives) {
-            LightSample sample = EmissiveTriSample(light, org, randomVec2f());
-            if (sample.pdf == 0.f) {continue;};
-            RTCRay shadowRay = makeRay(org, sample.wi, 0, sample.dist-EPSILON);  //do not intersect with light
-            rtcOccluded1(scene, &shadowRay, NULL);
-            if (shadowRay.tfar < EPSILON) {continue;} // shadowed
-            float cosTheta = std::max(0.f, dot(Ns,  sample.wi));
-            if (cosTheta == 0.f) {continue;}     
-            vec3f contrib = light.Le * cosTheta / sample.pdf;
-            Li += contrib;
-        }
-        float numSamples = emissives.size();
-        // Cosine weighted hemisphere sampling
-        vec3f h = cosineSampleHemisphere(randomVec2f());
-        // Transform to world space
-        vec3f b1, b2;
-        frisvad(Ns, b1, b2);
-        vec3f wi = h.x*b1 + h.y*b2 + h.z * Ns;
-        float cosTheta = h.z;
-        float pdf = cosTheta * float(one_over_pi);
+        // This is terrible, but I think it works thanks chatGPT
+        //  ─────────────────────── 1. LIGHT-SAMPLED PATH ───────────────────────
+        vec3f Lo_light{0};
+        {
+            std::uniform_int_distribution<size_t> pick(0, emissives.size() - 1);
+            const EmissiveTri &light = emissives[pick(rng)];
 
-        if (pdf > 0.f) {
-            float pdf = cosTheta * float(one_over_pi);
-            RTCRayHit newRH = makeRayHit(org, wi, 0);
-            Li += traceRay(qctx, iargs, newRH, depth + 1) / pdf;
-            ++numSamples;
-        }     
-        return mats.albedo[geomID] * Li * float(one_over_pi) / numSamples;
+            LightSample s = EmissiveTriSample(light, org, randomVec2f());
+
+            // probability of selecting this exact direction through the “pick one light” strategy
+            float pdfLight = s.pdf / float(emissives.size());
+
+            if (pdfLight > 0.f) {
+                RTCRay shadowRay = makeRay(org, s.wi, 0, s.dist - EPSILON);
+                rtcOccluded1(scene, &shadowRay, NULL);
+
+                if (shadowRay.tfar > 0.f) {                       // not shadowed
+                    float cosIn = std::max(0.f, dot(Ns, s.wi));
+                    if (cosIn > 0.f) {
+                        float pdfBSDF = cosIn * float(one_over_pi);   // competing pdf
+                        float w       = powerHeuristic(1, pdfLight, 1, pdfBSDF);
+
+                        Lo_light = light.Le * cosIn / pdfLight * w;
+                    }
+                }
+            }
+        }
+
+        //  ─────────────────────── 2. BSDF-SAMPLED PATH ────────────────────────
+        vec3f Lo_bsdf{0};
+        {
+            // cosine-weighted hemisphere sample in local frame
+            vec3f h  = cosineSampleHemisphere(randomVec2f());
+            vec3f b1, b2;
+            frisvad(Ns, b1, b2);
+
+            vec3f wi        = h.x * b1 + h.y * b2 + h.z * Ns;
+            float cosIn     = h.z;
+            float pdfBSDF   = cosIn * float(one_over_pi);
+
+            if (pdfBSDF > 0.f) {
+                // trace the BSDF ray
+                RTCRayHit rh = makeRayHit(org, wi, 0);
+                vec3f      Li = traceRay(qctx, iargs, rh, depth + 1);
+
+                // competing pdf from the light sampler for *this* direction
+                float pdfLight = 0.f;
+                rh = makeRayHit(org, wi, 0);
+
+                rtcIntersect1(scene, &rh, &iargs);
+                if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
+                    for (const EmissiveTri &e : emissives) {
+                        if (e.geomID == rh.hit.geomID && e.primID == rh.hit.primID) {
+                            // we hit an emissive triangle: convert its area pdf to solid angle
+                            vec3f p0, p1, p2;
+                            getTriangleVerts(e, p0, p1, p2);
+                            vec3f Ng   = normalize(cross(p1 - p0, p2 - p0));
+                            float dist = rh.ray.tfar;
+                            float cosL = std::fabs(dot(Ng, -wi));
+
+                            if (cosL > 0.f) {
+                                pdfLight = (dist * dist) / (e.area * cosL);
+                                pdfLight /= float(emissives.size());   // account for random-light pick
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                float w = powerHeuristic(1, pdfBSDF, 1, pdfLight);
+                Lo_bsdf = Li * cosIn / pdfBSDF * w;
+            }
+        }
+
+        //  ─────────────────────── 3. COMBINE & RETURN ────────────────────────
+        vec3f Lo = Lo_light + Lo_bsdf;
+
+        // Lambertian BRDF: f_r = albedo / π
+        return mats.albedo[geomID] * Lo * float(one_over_pi);
     }
 }
 
@@ -452,7 +506,7 @@ int main(int argc, char** argv) {
     cam.width_px  = 1200;
     cam.height_px = 1200;
 
-    const uint32_t SPP = 100*1024;
+    const uint32_t SPP = 10*128;
     const uint32_t W = cam.width_px;
     const uint32_t H = cam.height_px;
     const size_t   N = size_t(W) * H * SPP;
