@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(phos)
 
-# FlameGraph build
-set(CMAKE_CXX_FLAGS_DEBUG
-    "-O0 -g -fno-omit-frame-pointer")
+# # FlameGraph build
+# set(CMAKE_CXX_FLAGS_DEBUG
+#     "-O0 -g -fno-omit-frame-pointer")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +28,7 @@ target_include_directories(tinyobj INTERFACE
 add_library(core STATIC
     src/camera.cpp
     src/sensor.cpp
+    src/samplers.cpp
 )
 
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

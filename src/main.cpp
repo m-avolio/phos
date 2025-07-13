@@ -18,6 +18,7 @@
 
 #include "camera.h"
 #include "sensor.h"
+#include "samplers.h"
 
 static constexpr float EPSILON = 1e-5;
 static constexpr int MAX_DEPTH = 3;
@@ -292,11 +293,6 @@ LightSample EmissiveTriSample(const EmissiveTri &tri, const vec3f &origin, const
     return LightSample{point, Ng, wi, dist, pdf}; 
 }
 
-inline vec2f randomVec2f() {
-    static std::uniform_real_distribution<float> uni(0.0f, 1.0f);
-    return vec2f{uni(rng), uni(rng)};
-}
-
 
 // Revall Frisvad 2012
 inline void frisvad(const vec3f& n, vec3f& b1, vec3f& b2) {
@@ -338,6 +334,8 @@ inline float powerHeuristic(int nf, float fPdf, int ng, float gPdf) {
 vec3f traceRay(RTCRayQueryContext &qctx,
                RTCIntersectArguments &iargs,
                RTCRayHit rayhit,
+               CMJBuffer& rands,
+               const uint32_t s, 
                int depth) {
 
     if (depth >= MAX_DEPTH)  
@@ -391,23 +389,23 @@ vec3f traceRay(RTCRayQueryContext &qctx,
         vec3f wi = reflect(wo, Ns);
         // build new RTCRayHit
         RTCRayHit newRH = makeRayHit(org, wi, 0);
-        return mats.albedo[geomID] * traceRay(qctx, iargs, newRH, depth + 1);
+        return mats.albedo[geomID] * traceRay(qctx, iargs, newRH, rands, s, depth + 1);
     } else if (mats.emissive[geomID]) {
         return mats.albedo[geomID];
     } else {
         vec3f Lo_light{0};
         {
-            // Randomly Choose Light
+            // Randomly choose light TODO: change soon
             std::uniform_int_distribution<size_t> pick(0, emissives.size() - 1);
             const EmissiveTri &light = emissives[pick(rng)];
-            LightSample s = EmissiveTriSample(light, org, randomVec2f());
-            float pdfLight = s.pdf / float(emissives.size());
+            LightSample ls = EmissiveTriSample(light, org, CMJSample(rands, depth, s, 0));
+            float pdfLight = ls.pdf / float(emissives.size());
             if (pdfLight > 0.f) {
-                RTCRay shadowRay = makeRay(org, s.wi, 0, s.dist - EPSILON);
+                RTCRay shadowRay = makeRay(org, ls.wi, 0, ls.dist - EPSILON);
                 rtcOccluded1(scene, &shadowRay, NULL);
 
                 if (shadowRay.tfar > 0.f) {  // not shadowed
-                    float cosIn = dot(Ns, s.wi);
+                    float cosIn = dot(Ns, ls.wi);
                     if (cosIn > 0.f) {
                         float pdfBSDF = cosIn * float(one_over_pi);  // lambertian pdf
                         float w = powerHeuristic(1, pdfLight, 1, pdfBSDF);
@@ -419,7 +417,7 @@ vec3f traceRay(RTCRayQueryContext &qctx,
 
         vec3f Lo_bsdf{0};
         {
-            vec3f h  = cosineSampleHemisphere(randomVec2f());
+            vec3f h  = cosineSampleHemisphere(CMJSample(rands, depth, s, 0));
             vec3f b1, b2;
             frisvad(Ns, b1, b2);
 
@@ -429,7 +427,7 @@ vec3f traceRay(RTCRayQueryContext &qctx,
 
             if (pdfBSDF > 0.f) {
                 RTCRayHit rh = makeRayHit(org, wi, 0);
-                vec3f Li = traceRay(qctx, iargs, rh, depth + 1);
+                vec3f Li = traceRay(qctx, iargs, rh, rands, s, depth + 1);
 
                 // competing pdf from the light sampler for *this* direction
                 float pdfLight = 0.f;
@@ -470,6 +468,7 @@ inline void addSample(Framebuffer& fb,
     px[2] += c.z / float(spp);
 }
 
+
 /* -------------------------------------------------------------------------- */
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -477,9 +476,6 @@ int main(int argc, char** argv) {
         return 0;
     }
     const std::string objPath = argv[1];
-    /* TODO: - Change random number generation
-             - Make robust cosine
-    */
 
     /* Setup device + scene */
     device = initializeDevice();
@@ -521,26 +517,31 @@ int main(int argc, char** argv) {
         iargs.context = &qctx;
         iargs.flags   = RTC_RAY_QUERY_FLAG_COHERENT;
 
-        SensorSamples pixSamples;   allocSensorSamples(pixSamples, SPP);
-        RayBuffer     pixRays;      allocRayBuffer    (pixRays,    SPP);
+        SensorSamples samples;   allocSensorSamples(samples, SPP);
+        RayBuffer     rays;      allocRayBuffer    (rays,    SPP);
+        CMJBuffer     rands;     allocCMJBuffer    (rands,  MAX_DEPTH, SPP, 2);
         for (int y = T.y0; y < T.y1; ++y) {
             for (int x = T.x0; x < T.x1; ++x) {
                 generateSamplesForPixel(x, y,
                                         cam.width_px, cam.height_px,
                                         cam.width,     cam.height,
-                                        SPP, pixSamples);
+                                        SPP, samples);
 
-                generateRaysForPixel(cam, bas, pixSamples, SPP, pixRays);
+                generateRaysForPixel(cam, bas, samples, SPP, rays);
 
                 size_t pixelId = size_t(y) * W + x;
+                uint32_t pixelSeed = hash(pixelId);
+                fillCMJBuffer(rands, pixelSeed); // kind of slow
+
                 for (uint32_t s = 0; s < SPP; ++s) {
-                    vec3f col = traceRay(qctx, iargs, pixRays.rh[s], 0);
+                    vec3f col = traceRay(qctx, iargs, rays.rh[s], rands, s, 0);
                     addSample(fb, pixelId, col, SPP);
                 }
             }
         }
-        freeRayBuffer(pixRays);
-        freeSensorSamples(pixSamples);
+        freeSensorSamples(samples);
+        freeRayBuffer(rays);
+        freeCMJBuffer(rands);
     };
 
     auto t0 = std::chrono::high_resolution_clock::now();
