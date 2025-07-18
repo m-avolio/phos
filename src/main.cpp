@@ -21,7 +21,7 @@
 #include "samplers.h"
 
 static constexpr float EPSILON = 1e-5;
-static constexpr int MAX_DEPTH = 3;
+static constexpr int MAX_DEPTH = 5;
 static constexpr int LIGHT_SAMPLES = 1;
 
 inline RTCDevice device = nullptr;
@@ -180,7 +180,6 @@ void buildSceneFromOBJ(const std::string& objPath) {
                         int vi = idx.vertex_index;
                         int ni = idx.normal_index;
                         if (ni < 0) {
-                            printf("here"); 
                             continue;
                         }
 
@@ -333,10 +332,11 @@ inline float powerHeuristic(int nf, float fPdf, int ng, float gPdf) {
 
 vec3f traceRay(RTCRayQueryContext &qctx,
                RTCIntersectArguments &iargs,
-               RTCRayHit rayhit,
+               RTCRayHit& rayhit,
                CMJBuffer& rands,
                const uint32_t s, 
-               int depth) {
+               int depth,
+               bool specularBounce=false) {
 
     if (depth >= MAX_DEPTH)  
         return vec3f{0.0f,0.0f,0.0f};
@@ -389,75 +389,77 @@ vec3f traceRay(RTCRayQueryContext &qctx,
         vec3f wi = reflect(wo, Ns);
         // build new RTCRayHit
         RTCRayHit newRH = makeRayHit(org, wi, 0);
-        return mats.albedo[geomID] * traceRay(qctx, iargs, newRH, rands, s, depth + 1);
-    } else if (mats.emissive[geomID]) {
-        return mats.albedo[geomID];
-    } else {
-        vec3f Lo_light{0};
-        {
-            // Randomly choose light TODO: change soon
-            std::uniform_int_distribution<size_t> pick(0, emissives.size() - 1);
-            const EmissiveTri &light = emissives[pick(rng)];
-            LightSample ls = EmissiveTriSample(light, org, CMJSample(rands, depth, s, 0));
-            float pdfLight = ls.pdf / float(emissives.size());
-            if (pdfLight > 0.f) {
-                RTCRay shadowRay = makeRay(org, ls.wi, 0, ls.dist - EPSILON);
-                rtcOccluded1(scene, &shadowRay, NULL);
-
-                if (shadowRay.tfar > 0.f) {  // not shadowed
-                    float cosIn = dot(Ns, ls.wi);
-                    if (cosIn > 0.f) {
-                        float pdfBSDF = cosIn * float(one_over_pi);  // lambertian pdf
-                        float w = powerHeuristic(1, pdfLight, 1, pdfBSDF);
-                        Lo_light = light.Le * cosIn / pdfLight * w;
-                    }
-                }
-            }
-        }
-
-        vec3f Lo_bsdf{0};
-        {
-            vec3f h  = cosineSampleHemisphere(CMJSample(rands, depth, s, 0));
-            vec3f b1, b2;
-            frisvad(Ns, b1, b2);
-
-            vec3f wi        = h.x * b1 + h.y * b2 + h.z * Ns;
-            float cosIn     = h.z;
-            float pdfBSDF   = cosIn * float(one_over_pi);
-
-            if (pdfBSDF > 0.f) {
-                RTCRayHit rh = makeRayHit(org, wi, 0);
-                vec3f Li = traceRay(qctx, iargs, rh, rands, s, depth + 1);
-
-                // competing pdf from the light sampler for *this* direction
-                float pdfLight = 0.f;
-                if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID && mats.emissive[rh.hit.geomID]) {
-                    for (const EmissiveTri &e : emissives) {
-                        if (e.geomID == rh.hit.geomID && e.primID == rh.hit.primID) { // TODO: need a better way of checking if it hit an emissive
-                            vec3f p0, p1, p2;
-                            getTriangleVerts(e, p0, p1, p2);
-                            vec3f Ng   = normalize(cross(p1 - p0, p2 - p0));
-                            float dist = rh.ray.tfar;
-                            float cosL = dot(Ng, -wi);
-
-                            if (cosL > 0.f) {
-                                pdfLight = (dist * dist) / (e.area * cosL);
-                                pdfLight /= float(emissives.size());
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                float w = powerHeuristic(1, pdfBSDF, 1, pdfLight);
-                Lo_bsdf = Li * cosIn / pdfBSDF * w;
-            }
-        }
-
-        vec3f Lo = Lo_light + Lo_bsdf;
-
-        return mats.albedo[geomID] * Lo * float(one_over_pi);
+        return mats.albedo[geomID] * traceRay(qctx, iargs, newRH, rands, s, depth + 1, true);
     }
+
+    vec3f Le{0};
+    if (mats.emissive[geomID] && (depth == 0 || specularBounce)) { // Limiting to first depth seems wrong (Tu Wien)
+        Le = mats.albedo[geomID];
+    }
+    vec3f Li_direct{0};
+    {
+        // Randomly choose light TODO: change soon
+        std::uniform_int_distribution<size_t> pick_light(0, emissives.size() - 1);
+        const EmissiveTri &light = emissives[pick_light(rng)];
+        LightSample ls = EmissiveTriSample(light, org, CMJSample(rands, depth, s, 0));
+        float pdfLight = ls.pdf / float(emissives.size());
+        if (pdfLight > 0.f) {
+            RTCRay shadowRay = makeRay(org, ls.wi, 0, ls.dist - EPSILON);
+            rtcOccluded1(scene, &shadowRay, NULL);
+
+            if (shadowRay.tfar > 0.f) {  // not shadowed
+                float cosIn = dot(Ns, ls.wi);
+                if (cosIn > 0.f) {
+                    float pdfBSDF = cosIn * float(one_over_pi);  // lambertian pdf
+                    float w = powerHeuristic(1, pdfLight, 1, pdfBSDF);
+                    Li_direct = light.Le * cosIn / pdfLight * w;
+                }
+            }
+        }
+    }
+
+    vec3f Li_indirect{0};
+    {
+        vec3f h  = cosineSampleHemisphere(CMJSample(rands, depth, s, 0));
+        vec3f b1, b2;
+        frisvad(Ns, b1, b2);
+
+        vec3f wi        = h.x * b1 + h.y * b2 + h.z * Ns;
+        float cosIn     = h.z;
+        float pdfBSDF   = cosIn * float(one_over_pi);
+
+        if (pdfBSDF > 0.f) {
+            RTCRayHit rh = makeRayHit(org, wi, 0);
+            vec3f Li = traceRay(qctx, iargs, rh, rands, s, depth + 1);
+
+            float pdfLight = 0.f;
+            if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID && mats.emissive[rh.hit.geomID]) {
+                for (const EmissiveTri &e : emissives) {
+                    if (e.geomID == rh.hit.geomID && e.primID == rh.hit.primID) { // TODO: need a better way of checking if it hit an emissive
+                        vec3f p0, p1, p2;
+                        getTriangleVerts(e, p0, p1, p2);
+                        vec3f Ng   = normalize(cross(p1 - p0, p2 - p0));
+                        float dist = rh.ray.tfar;
+                        float cosL = dot(Ng, -wi);
+
+                        if (cosL > 0.f) {
+                            pdfLight = (dist * dist) / (e.area * cosL);
+                            pdfLight /= float(emissives.size());
+
+                            float w = powerHeuristic(1, pdfBSDF, 1, pdfLight);
+                            Li_direct += e.Le * cosIn / pdfBSDF * w; 
+                        }
+                        break;
+                    }
+                }
+            }
+
+            Li_indirect = Li * cosIn / pdfBSDF;
+        }
+    }
+    vec3f Li = Li_direct + Li_indirect;
+    vec3f BRDF = mats.albedo[geomID] * float(one_over_pi);
+    return Le + BRDF * Li;
 }
 
 inline void addSample(Framebuffer& fb,
@@ -490,7 +492,7 @@ int main(int argc, char** argv) {
     cam.width_px  = 600;
     cam.height_px = 600;
 
-    const uint32_t SPP = 10*128;
+    const uint32_t SPP = 128;
     const uint32_t W = cam.width_px;
     const uint32_t H = cam.height_px;
     const size_t   N = size_t(W) * H * SPP;
