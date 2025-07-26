@@ -251,8 +251,27 @@ void buildSceneFromOBJ(const std::string& objPath) {
     rtcCommitScene(scene);
 }
 
-vec3f reflect(vec3f wi, vec3f n) {
-    return -2 * (dot(wi, n)) * n + wi;
+vec3f reflect(vec3f wo, vec3f n) {
+    return -wo + 2 * dot(wo, n) * n;
+}
+
+float SafeSqrt(float x) { return std::sqrt(std::max(0.f, x)); }
+
+bool refract(vec3f wi, vec3f n, float eta, vec3f& wt) {
+    float cosTheta_i = dot(wi, n);
+    if (cosTheta_i < 0) {
+        eta = 1 / eta;
+        cosTheta_i = -cosTheta_i;
+        n = -n;
+    }
+    float sin2Theta_i = std::max(0.f, 1.f - (cosTheta_i*cosTheta_i));
+    float sin2Theta_t = sin2Theta_i / (eta*eta);
+    float cosTheta_t = SafeSqrt(1 - sin2Theta_t);
+    if (sin2Theta_t >= 1) {
+        return false;
+    }
+    wt = -wi / eta + (cosTheta_i / eta - cosTheta_t) * n;
+    return true;
 }
 
 // PBRTv3
@@ -379,31 +398,41 @@ vec3f traceRay(RTCRayQueryContext &qctx,
 
     if (NsBuf[0] || NsBuf[1] || NsBuf[2]) { Ns = normalize(vec3f{NsBuf[0], NsBuf[1], NsBuf[2]}); }
 
-    if (dot(Ns, Ng) < 0.0f) { Ns = -Ns; }
+    if (dot(Ns, Ng) < 0.0f) { Ns = -Ns;}
 
-    vec3f wo = normalize(vec3f{
+    vec3f rayDir = normalize(vec3f{
         rayhit.ray.dir_x,
         rayhit.ray.dir_y,
         rayhit.ray.dir_z
     });
 
-    // Move position in direction of geom normal 
-    vec3f org = vec3f{
-        rayhit.ray.org_x + wo.x * rayhit.ray.tfar + Ng.x * EPSILON,
-        rayhit.ray.org_y + wo.y * rayhit.ray.tfar + Ng.y * EPSILON,
-        rayhit.ray.org_z + wo.z * rayhit.ray.tfar + Ng.z * EPSILON
-    };
+    vec3f org = vec3f{rayhit.ray.org_x, rayhit.ray.org_y, rayhit.ray.org_z} + rayDir*rayhit.ray.tfar;
+    vec3f offset = Ng * EPSILON;
+    vec3f wo = -rayDir;
 
     if (mats.specular[geomID]) {
-        vec3f wi = reflect(wo, Ns);
+        // Temporarily all glass
+        vec3f wi{0};
+        // std::cout << mats.ior[geomID].real() << std::endl;
+        if (refract(wo, Ns, mats.ior[geomID].real(), wi)) {
+            if (dot(wo, Ns) > 0) {
+                offset = -offset;
+            }
+        } else {
+            wi = reflect(wo, Ns);
+            if (dot(wo, Ns) < 0) {
+                offset = -offset;
+            }
+        }
         // build new RTCRayHit
-        RTCRayHit newRH = makeRayHit(org, wi, 0);
+        RTCRayHit newRH = makeRayHit(org + offset, wi, 0);
         return mats.albedo[geomID] * traceRay(qctx, iargs, newRH, rands, s, depth + 1, true);
     }
 
+    org += offset;
     vec3f Le{0};
-    if (mats.emissive[geomID] && (depth == 0 || specularBounce)) { // Limiting to first depth seems wrong (Tu Wien)
-        Le = mats.albedo[geomID];
+    if (mats.emissive[geomID] && (depth == 0 || specularBounce)) {
+        Le = mats.albedo[geomID]; // TODO: Change this 
     }
     vec3f Li_direct{0};
     {
