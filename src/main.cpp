@@ -9,6 +9,7 @@
 #include <chrono>
 #include <complex>
 #include <thread>
+#include <unordered_map>
 
 #include "rkcommon/math/vec.h"
 #include "rkcommon/memory/malloc.h"
@@ -30,8 +31,8 @@ inline RTCScene scene = nullptr;
 // DEBUG Purposes, remove later or find a better way
 #define DEBUG
 #ifdef DEBUG
-inline std::atomic<uint64_t> rayTraversals{0};
-inline thread_local uint64_t tlsRays = 0;
+inline std::atomic<uint32_t> rayTraversals{0};
+inline thread_local uint32_t tlsRays = 0;
 
 inline void rtcIntersect1Count(RTCScene s, RTCRayHit* rh, RTCIntersectArguments* a)
 {
@@ -70,6 +71,7 @@ struct EmissiveTri {
 // Globals
 inline Material mats;
 inline std::vector<EmissiveTri> emissives;
+inline std::unordered_map<uint64_t, std::size_t> emissive_index;
 std::mt19937 rng{ 42 };
 
 void errorFunction(void* userPtr, enum RTCError error, const char* str) {
@@ -84,6 +86,10 @@ RTCDevice initializeDevice() {
 
   rtcSetDeviceErrorFunction(device, errorFunction, NULL);
   return device;
+}
+
+inline uint64_t pack_key(uint32_t geomID, uint32_t primID) {
+    return (uint64_t(geomID) << 32) | uint64_t(primID);
 }
 
 void buildSceneFromOBJ(const std::string& objPath) {
@@ -227,7 +233,10 @@ void buildSceneFromOBJ(const std::string& objPath) {
                     vec3f p2{vBuf[3*i2 + 0], vBuf[3*i2 + 1], vBuf[3*i2 + 2]};
 
                     float area = 0.5f * length(cross(p1 - p0, p2 - p0));
-                    emissives.push_back(EmissiveTri{geomID, t, iBuf, vBuf, area, area * dot(Le, vec3f(0.3333f)), Le}); //TODO: Should I divide by pi*area?
+                    size_t idx = emissives.size();
+                    uint64_t key = pack_key(geomID, t);
+                    emissive_index[key] = idx;
+                    emissives.push_back(EmissiveTri{geomID, t, iBuf, vBuf, area, area * dot(Le, vec3f(0.3333f)), Le});
                 }
             }
         } else { // default material
@@ -434,27 +443,26 @@ vec3f traceRay(RTCRayQueryContext &qctx,
 
             float pdfLight = 0.f;
             if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID && mats.emissive[rh.hit.geomID]) {
-                for (const EmissiveTri &e : emissives) {
-                    if (e.geomID == rh.hit.geomID && e.primID == rh.hit.primID) { // TODO: need a better way of checking if it hit an emissive
-                        vec3f p0, p1, p2;
-                        getTriangleVerts(e, p0, p1, p2);
-                        vec3f Ng   = normalize(cross(p1 - p0, p2 - p0));
-                        float dist = rh.ray.tfar;
-                        float cosL = dot(Ng, -wi);
+                uint64_t key = pack_key(rh.hit.geomID, rh.hit.primID);
+                if (emissive_index.find(key) != emissive_index.end()) {
+                    EmissiveTri e = emissives[emissive_index[key]];
+                    vec3f p0, p1, p2;
+                    getTriangleVerts(e, p0, p1, p2);
+                    vec3f Ng   = normalize(cross(p1 - p0, p2 - p0));
+                    float dist = rh.ray.tfar;
+                    float cosL = dot(Ng, -wi);
 
-                        if (cosL > 0.f) {
-                            pdfLight = (dist * dist) / (e.area * cosL);
-                            pdfLight /= float(emissives.size());
+                    if (cosL > 0.f) {
+                        pdfLight = (dist * dist) / (e.area * cosL);
+                        pdfLight /= float(emissives.size());
 
-                            float w = powerHeuristic(1, pdfBSDF, 1, pdfLight);
-                            Li_direct += e.Le * cosIn / pdfBSDF * w; 
-                        }
-                        break;
+                        float w = powerHeuristic(1, pdfBSDF, 1, pdfLight);
+                        Li_direct += e.Le * cosIn / pdfBSDF * w; 
                     }
                 }
+            } else {
+                Li_indirect = Li * cosIn / pdfBSDF;
             }
-
-            Li_indirect = Li * cosIn / pdfBSDF;
         }
     }
     vec3f Li = Li_direct + Li_indirect;
